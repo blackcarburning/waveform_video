@@ -116,15 +116,32 @@ def load_audio_samples(path):
                     samples = np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32768.0
                 elif sw == 1:
                     samples = np.frombuffer(raw, dtype=np.uint8).astype(np.float64) / 128.0 - 1.0
+                elif sw == 3:
+                    # 24-bit: unpack 3-byte little-endian signed integers.
+                    # Values >= 2^23 represent negative numbers (two's complement),
+                    # so subtract 2^24 to restore the correct sign.
+                    raw_bytes = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+                    int32 = (raw_bytes[:, 0].astype(np.int32)
+                             | (raw_bytes[:, 1].astype(np.int32) << 8)
+                             | (raw_bytes[:, 2].astype(np.int32) << 16))
+                    int32[int32 >= (1 << 23)] -= (1 << 24)
+                    samples = int32.astype(np.float64) / (1 << 23)
+                elif sw == 4:
+                    samples = np.frombuffer(raw, dtype=np.int32).astype(np.float64) / (1 << 31)
                 else:
                     return None
                 if nch > 1:
                     samples = samples.reshape(-1, nch).mean(axis=1)
-                if sr != AUDIO_SR:
-                    old_t = np.linspace(0, 1, len(samples))
-                    new_n = int(len(samples) * AUDIO_SR / sr)
-                    new_t = np.linspace(0, 1, new_n)
-                    samples = np.interp(new_t, old_t, samples)
+                try:
+                    if sr != AUDIO_SR:
+                        old_t = np.linspace(0, 1, len(samples))
+                        new_n = int(len(samples) * AUDIO_SR / sr)
+                        new_t = np.linspace(0, 1, new_n)
+                        samples = np.interp(new_t, old_t, samples)
+                except Exception:
+                    # Resampling failed; return samples at original rate.
+                    # Envelope timing may be slightly off but is still usable.
+                    pass
                 return samples
     except Exception:
         return None
@@ -780,7 +797,8 @@ class WaveformApp(tk.Tk):
                 self.audio_lbl.config(text=f"✓ {os.path.basename(path)} ({dur:.1f}s)")
             else:
                 self._audio_samples = None
-                self.audio_lbl.config(text=f"✓ {os.path.basename(path)}")
+                self.audio_lbl.config(
+                    text="✓ playback OK · ⚠ envelope extraction failed")
         except Exception as e:
             self._audio_loaded = False
             self._audio_path = None
@@ -1036,10 +1054,20 @@ class WaveformApp(tk.Tk):
                 self.audio_mod_info.config(text="(depth = 0)")
         elif self._audio_samples is not None:
             self.audio_meter_lbl.config(text="Level: (paused)")
-            self.audio_mod_info.config(text="")
+            depth = self.audio_mod_depth.get()
+            if depth > 0:
+                self.audio_mod_info.config(
+                    text=f"→ {self.audio_mod_type.get()} depth={depth:.2f} (paused)")
+            else:
+                self.audio_mod_info.config(text="(depth = 0)")
+        elif self._audio_loaded:
+            if self.audio_mod_depth.get() > 0:
+                self.audio_mod_info.config(text="⚠ No envelope data")
+            else:
+                self.audio_mod_info.config(text="")
         else:
             if self.audio_mod_depth.get() > 0:
-                self.audio_mod_info.config(text="No audio")
+                self.audio_mod_info.config(text="No audio loaded")
             else:
                 self.audio_mod_info.config(text="")
 
