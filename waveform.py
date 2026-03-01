@@ -407,6 +407,7 @@ class WaveformApp(tk.Tk):
         self._audio_loaded = False
         self._audio_samples = None
         self.xmod_vars: list[list[tk.BooleanVar]] = []
+        self.audio_mod_enabled = tk.BooleanVar(value=False)
 
         self._recording = False
         self._rec_stop = False
@@ -624,6 +625,7 @@ class WaveformApp(tk.Tk):
         self.audio_mod_type = tk.StringVar(value="AM")
         ttk.Combobox(am_r0, textvariable=self.audio_mod_type, values=AUDIO_MOD_TYPES,
                      state="readonly", width=4).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(am_r0, text="Connect", variable=self.audio_mod_enabled).pack(side="left", padx=(0, 6))
         self.audio_mod_info = ttk.Label(am_r0, text="", style="AudioMod.TLabel")
         self.audio_mod_info.pack(side="left", padx=4)
 
@@ -883,7 +885,7 @@ class WaveformApp(tk.Tk):
             "xmod": [[self.xmod_vars[i][j].get() for j in range(4)] for i in range(4)],
             "audio_mod": {
                 "type": self.audio_mod_type.get(),
-                "depth": self.audio_mod_depth.get(),
+                "depth": self.audio_mod_depth.get() if self.audio_mod_enabled.get() else 0.0,
                 "gain": self.audio_mod_gain.get(),
                 "smoothing": self.audio_mod_smoothing.get(),
             },
@@ -1038,7 +1040,10 @@ class WaveformApp(tk.Tk):
         self.time_lbl.config(text=f"{m:02d}:{sec:06.3f}")
 
         # Audio level meter
-        if self._audio_samples is not None and self.playing:
+        if not self.audio_mod_enabled.get():
+            self.audio_meter_lbl.config(text="Level: ────────────────────")
+            self.audio_mod_info.config(text="☐ disconnected")
+        elif self._audio_samples is not None and self.playing:
             level = compute_audio_envelope(
                 self._audio_samples, wall, self.audio_mod_smoothing.get())
             level *= self.audio_mod_gain.get()
@@ -1059,17 +1064,11 @@ class WaveformApp(tk.Tk):
                 self.audio_mod_info.config(
                     text=f"→ {self.audio_mod_type.get()} depth={depth:.2f} (paused)")
             else:
-                self.audio_mod_info.config(text="(depth = 0)")
+                self.audio_mod_info.config(text="(paused)")
         elif self._audio_loaded:
-            if self.audio_mod_depth.get() > 0:
-                self.audio_mod_info.config(text="⚠ No envelope data")
-            else:
-                self.audio_mod_info.config(text="")
+            self.audio_mod_info.config(text="⚠ no envelope data")
         else:
-            if self.audio_mod_depth.get() > 0:
-                self.audio_mod_info.config(text="No audio loaded")
-            else:
-                self.audio_mod_info.config(text="")
+            self.audio_mod_info.config(text="⚠ no audio loaded")
 
         params = self._build_params()
         pf = render_frame(PREVIEW_W, PREVIEW_H, wall, params, self._audio_samples)
@@ -1108,6 +1107,7 @@ class WaveformApp(tk.Tk):
                 "depth": self.audio_mod_depth.get(),
                 "gain": self.audio_mod_gain.get(),
                 "smoothing": self.audio_mod_smoothing.get(),
+                "enabled": self.audio_mod_enabled.get(),
             },
             "audio_path": self._audio_path,
             "export_duration": self.duration_var.get(),
@@ -1147,6 +1147,7 @@ class WaveformApp(tk.Tk):
         self.audio_mod_depth.set(am.get("depth", 0.0))
         self.audio_mod_gain.set(am.get("gain", 1.0))
         self.audio_mod_smoothing.set(am.get("smoothing", 0.05))
+        self.audio_mod_enabled.set(am.get("enabled", False))
         self.duration_var.set(p.get("export_duration", 5))
         self.format_var.set(p.get("export_format", "MP4"))
         self.res_var.set(p.get("export_res", "4K (2160×3840)"))
