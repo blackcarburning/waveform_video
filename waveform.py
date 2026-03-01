@@ -444,15 +444,10 @@ class WaveformApp(tk.Tk):
         self.audio_mod_enabled = tk.BooleanVar(value=False)
         self.audio_inject_enabled = tk.BooleanVar(value=False)
 
-        self._recording = False
-        self._rec_stop = False
-        self._rec_thread = None
-        self._rec_path = None
-        self._rec_frames = 0
-        self._rec_status = ""
-        self._rec_count_in = False
-        self._rec_count_start = 0.0
-        self._beat_duration = 0.5
+        self._automation_data = {}
+        self._auto_mode = "off"
+        self._overdub_buffer = {}
+        self._overdub_start_t = 0.0
 
         self._trail_buffers = {}
 
@@ -701,21 +696,32 @@ class WaveformApp(tk.Tk):
 
         self._audio_mod_slider(amf, "Inject Amp", 0.0, 1.0, 0.0, "audio_inject_amp")
 
-        # ── Live Record ──────────────────────────────────────────────────
-        rf = ttk.LabelFrame(col_right, text="LIVE RECORD (AVI → Downloads)")
-        rf.pack(fill="x", pady=(0, 4))
-        rr = ttk.Frame(rf)
-        rr.pack(fill="x", padx=4, pady=3)
-        ttk.Label(rr, text="Res").pack(side="left", padx=(0, 4))
-        self.rec_res_var = tk.StringVar(value="1080×1920")
-        ttk.Combobox(rr, textvariable=self.rec_res_var,
-                     values=["1080×1920", "4K (2160×3840)"],
-                     state="readonly", width=14).pack(side="left", padx=(0, 8))
-        self.rec_btn = ttk.Button(rr, text="⏺  REC (4-beat count-in)",
-                                  command=self._toggle_recording)
-        self.rec_btn.pack(side="left")
-        self.rec_lbl = ttk.Label(rf, text="Ready", style="Rec.TLabel")
-        self.rec_lbl.pack(fill="x", padx=4, pady=(0, 3))
+        # ── Automation ──────────────────────────────────────────────────
+        af = ttk.LabelFrame(col_right, text="AUTOMATION")
+        af.pack(fill="x", pady=(0, 4))
+
+        ar0 = ttk.Frame(af)
+        ar0.pack(fill="x", padx=4, pady=3)
+
+        self.auto_write_btn = tk.Button(
+            ar0, text="✎ WRITE", bg="#333333", fg="#cccccc",
+            activebackground="#333333", relief="raised", bd=1,
+            padx=4, pady=1, command=self._auto_write, width=8)
+        self.auto_write_btn.pack(side="left", padx=(0, 4))
+
+        self.auto_overdub_btn = tk.Button(
+            ar0, text="⊕ OVERDUB", bg="#333333", fg="#cccccc",
+            activebackground="#333333", relief="raised", bd=1,
+            padx=4, pady=1, command=self._auto_overdub, width=9)
+        self.auto_overdub_btn.pack(side="left", padx=(0, 4))
+
+        self.auto_reset_btn = ttk.Button(
+            ar0, text="↺ RESET", command=self._auto_reset, width=8)
+        self.auto_reset_btn.pack(side="left")
+
+        self.auto_status_lbl = ttk.Label(af, text="No automation",
+            style="Rec.TLabel")
+        self.auto_status_lbl.pack(fill="x", padx=4, pady=(0, 3))
 
         # ── Offline Export ───────────────────────────────────────────────
         ef = ttk.LabelFrame(col_right, text="OFFLINE EXPORT (video only)")
@@ -947,8 +953,10 @@ class WaveformApp(tk.Tk):
         self._elapsed = 0.0
         self._stop_audio()
         self.play_btn.config(text="▶  PLAY")
-        if self._recording or self._rec_count_in:
-            self._stop_recording()
+        if self._auto_mode == "write":
+            self._auto_stop_write()
+        elif self._auto_mode == "overdub":
+            self._auto_stop_overdub()
 
     # ── Params ───────────────────────────────────────────────────────────
 
@@ -993,87 +1001,203 @@ class WaveformApp(tk.Tk):
             "line_trail": self.line_trail.get(),
         }
 
-    # ── Live Recording ───────────────────────────────────────────────────
+    # ── Automation ───────────────────────────────────────────────────────
 
-    def _toggle_recording(self):
-        if self._recording or self._rec_count_in:
-            self._stop_recording()
+    def _get_automatable_params(self):
+        """Return dict mapping automation key -> DoubleVar."""
+        d = {
+            "amplitude": self.amplitude,
+            "overdrive": self.overdrive,
+            "drift_fine": self.drift_fine_var,
+            "line_thickness": self.line_thickness,
+            "line_glow": self.line_glow,
+            "line_bloom": self.line_bloom,
+            "line_trail": self.line_trail,
+            "audio_mod_depth": self.audio_mod_depth,
+            "audio_mod_gain": self.audio_mod_gain,
+            "audio_mod_smoothing": self.audio_mod_smoothing,
+            "audio_inject_amp": self.audio_inject_amp,
+            "timebase": self.timebase_var,
+        }
+        for i in range(4):
+            d[f"mod{i}_depth"] = self.mod_vars[i]["depth"]
+            d[f"mod{i}_amp"] = self.mod_vars[i]["amp"]
+        return d
+
+    def _auto_record_tick(self):
+        """Called from _tick() when recording automation."""
+        t = self._wall_time()
+        params = self._get_automatable_params()
+        for key, var in params.items():
+            val = var.get()
+            lane = self._automation_data.setdefault(key, [])
+            if not lane or abs(lane[-1]["v"] - val) > 1e-6:
+                lane.append({"t": t, "v": val})
+
+    def _auto_overdub_tick(self):
+        """Called from _tick() when overdubbing automation."""
+        t = self._wall_time()
+        params = self._get_automatable_params()
+        for key, var in params.items():
+            val = var.get()
+            lane = self._overdub_buffer.setdefault(key, [])
+            if not lane or abs(lane[-1]["v"] - val) > 1e-6:
+                lane.append({"t": t, "v": val})
+
+    def _auto_playback_tick(self):
+        """Called from _tick() when playing back automation."""
+        t = self._wall_time()
+        params = self._get_automatable_params()
+        for key, var in params.items():
+            lane = self._automation_data.get(key, [])
+            if not lane:
+                continue
+            val = self._interpolate_lane(lane, t)
+            if val is not None:
+                var.set(val)
+
+    def _interpolate_lane(self, lane, t):
+        """Linear interpolation between keyframes."""
+        if not lane:
+            return None
+        if t <= lane[0]["t"]:
+            return lane[0]["v"]
+        if t >= lane[-1]["t"]:
+            return lane[-1]["v"]
+        lo, hi = 0, len(lane) - 1
+        while lo < hi - 1:
+            mid = (lo + hi) // 2
+            if lane[mid]["t"] <= t:
+                lo = mid
+            else:
+                hi = mid
+        t0, v0 = lane[lo]["t"], lane[lo]["v"]
+        t1, v1 = lane[hi]["t"], lane[hi]["v"]
+        if t1 == t0:
+            return v0
+        frac = (t - t0) / (t1 - t0)
+        return v0 + (v1 - v0) * frac
+
+    def _apply_automation_to_params(self, params, t):
+        """Override params dict values with automation data at time t."""
+        for key, lane in self._automation_data.items():
+            if not lane:
+                continue
+            val = self._interpolate_lane(lane, t)
+            if val is None:
+                continue
+            if key == "amplitude":
+                params["base_amplitude"] = val
+            elif key == "overdrive":
+                params["overdrive"] = val
+            elif key == "drift_fine":
+                params["drift_fine"] = val
+            elif key == "timebase":
+                params["timebase"] = val
+            elif key == "line_thickness":
+                params["line_thickness"] = val
+            elif key == "line_glow":
+                params["line_glow"] = val
+            elif key == "line_bloom":
+                params["line_bloom"] = val
+            elif key == "line_trail":
+                params["line_trail"] = val
+            elif key == "audio_mod_depth":
+                params["audio_mod"]["depth"] = val
+            elif key == "audio_mod_gain":
+                params["audio_mod"]["gain"] = val
+            elif key == "audio_mod_smoothing":
+                params["audio_mod"]["smoothing"] = val
+            elif key == "audio_inject_amp":
+                params["audio_inject"]["amplitude"] = val
+            elif key.startswith("mod") and "_" in key:
+                parts = key.split("_", 1)
+                idx = int(parts[0][3:])
+                field = parts[1]
+                if field == "depth":
+                    params["modulators"][idx]["depth"] = val
+                elif field == "amp":
+                    params["modulators"][idx]["amplitude"] = val
+        return params
+
+    def _auto_write(self):
+        if self._auto_mode == "write":
+            self._auto_stop_write()
         else:
-            self._start_count_in()
+            self._auto_mode = "write"
+            self._automation_data = {}
+            self._elapsed = 0.0
+            self._t0 = time.time()
+            self.playing = True
+            self.play_btn.config(text="⏸  PAUSE")
+            if HAS_PYGAME and self._audio_loaded:
+                try:
+                    pygame.mixer.music.play(0)
+                except Exception:
+                    pass
+            self.auto_write_btn.config(
+                text="■ STOP WRITE", bg="#662222", fg="#ffaaaa",
+                activebackground="#662222")
 
-    def _start_count_in(self):
-        self._stop()
-        self._beat_duration = 60.0 / self.bpm_var.get()
-        self._rec_count_in = True
-        self._rec_count_start = time.time()
-        res = self.rec_res_var.get()
-        self._rec_w, self._rec_h = (2160, 3840) if "4K" in res else (1080, 1920)
-        self._rec_path = os.path.join(
-            DOWNLOADS, f"oscilloscope_{time.strftime('%Y%m%d_%H%M%S')}.avi")
-        self.rec_btn.config(text="⏹  STOP REC")
-        self.rec_lbl.config(text="Count-in…")
+    def _auto_stop_write(self):
+        self._auto_mode = "off"
+        self.auto_write_btn.config(
+            text="✎ WRITE", bg="#333333", fg="#cccccc",
+            activebackground="#333333")
 
-    def _begin_recording(self):
-        self._rec_count_in = False
-        self._rec_stop = False
-        self._rec_frames = 0
-        self._rec_status = "Starting…"
-        self._rec_params = self._build_params()
-        self._rec_audio_samples = self._audio_samples
-        self._elapsed = 0.0
-        self._t0 = time.time()
-        self.playing = True
-        self.play_btn.config(text="⏸  PAUSE")
-        if HAS_PYGAME and self._audio_loaded:
-            try:
-                pygame.mixer.music.play(0)
-            except Exception:
-                pass
-        self._recording = True
-        self._rec_thread = threading.Thread(target=self._rec_worker, daemon=True)
-        self._rec_thread.start()
+    def _auto_overdub(self):
+        if self._auto_mode == "overdub":
+            self._auto_stop_overdub()
+        else:
+            self._auto_mode = "overdub"
+            self._overdub_buffer = {}
+            self._overdub_start_t = self._wall_time()
+            self._elapsed = 0.0
+            self._t0 = time.time()
+            self.playing = True
+            self.play_btn.config(text="⏸  PAUSE")
+            if HAS_PYGAME and self._audio_loaded:
+                try:
+                    pygame.mixer.music.play(0)
+                except Exception:
+                    pass
+            self.auto_overdub_btn.config(
+                text="■ STOP ODUB", bg="#664422", fg="#ffddaa",
+                activebackground="#664422")
 
-    def _rec_worker(self):
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(self._rec_path, fourcc, FPS, (self._rec_w, self._rec_h))
-        if not writer.isOpened():
-            self._rec_status = "ERROR: writer failed"
-            self._recording = False
-            return
-        params = self._rec_params
-        samples = self._rec_audio_samples
-        trail_buffers = {}
-        fn = 0
-        t0 = time.time()
-        while not self._rec_stop:
-            t = fn * FRAME_DUR
-            frame = render_frame(self._rec_w, self._rec_h, t, params, samples, trail_buffers)
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            fn += 1
-            self._rec_frames = fn
-            self._rec_status = f"⏺ REC  {fn * FRAME_DUR:.1f}s  ({fn} frames)"
-            target = t0 + fn * FRAME_DUR
-            sl = target - time.time()
-            if sl > 0:
-                time.sleep(sl)
-        writer.release()
-        if self._rec_path and os.path.isfile(self._rec_path):
-            fs = os.path.getsize(self._rec_path) / (1024 * 1024)
-            self._rec_status = (
-                f"Saved: {os.path.basename(self._rec_path)} "
-                f"· {fn * FRAME_DUR:.1f}s · {fs:.1f}MB"
-            )
-        self._recording = False
+    def _auto_stop_overdub(self):
+        self._auto_mode = "off"
+        # Splice overdub buffer into main automation data
+        t_start = self._overdub_start_t
+        t_end = self._wall_time()
+        for key, new_lane in self._overdub_buffer.items():
+            if not new_lane:
+                continue
+            existing = self._automation_data.get(key, [])
+            # Remove keyframes in the overdubbed time range
+            kept = [kf for kf in existing if not (t_start <= kf["t"] <= t_end)]
+            # Insert new keyframes and sort
+            merged = kept + new_lane
+            merged.sort(key=lambda kf: kf["t"])
+            self._automation_data[key] = merged
+        self._overdub_buffer = {}
+        self.auto_overdub_btn.config(
+            text="⊕ OVERDUB", bg="#333333", fg="#cccccc",
+            activebackground="#333333")
 
-    def _stop_recording(self):
-        self._rec_count_in = False
-        self._rec_stop = True
-        if self._rec_thread and self._rec_thread.is_alive():
-            self._rec_thread.join(timeout=3.0)
-        self._rec_thread = None
-        self._recording = False
-        self.rec_btn.config(text="⏺  REC (4-beat count-in)")
-        self.rec_lbl.config(text=self._rec_status or "Ready")
+    def _auto_reset(self):
+        from tkinter import messagebox as _mb
+        if _mb.askyesno("Reset", "Clear all automation?"):
+            self._automation_data = {}
+            self._overdub_buffer = {}
+            self._auto_mode = "off"
+            self.auto_write_btn.config(
+                text="✎ WRITE", bg="#333333", fg="#cccccc",
+                activebackground="#333333")
+            self.auto_overdub_btn.config(
+                text="⊕ OVERDUB", bg="#333333", fg="#cccccc",
+                activebackground="#333333")
+            self.auto_status_lbl.config(text="No automation")
 
     # ── Preview Loop ─────────────────────────────────────────────────────
 
@@ -1123,24 +1247,28 @@ class WaveformApp(tk.Tk):
             r = RATIO_VALUES.get(mv["ratio"].get(), 1.0)
             mv["hz_lbl"].config(text=f"{r:.1f}× · {temporal_hz * r:.3f} Hz")
 
-        # Count-in
-        if self._rec_count_in:
-            elapsed = time.time() - self._rec_count_start
-            bn = int(elapsed / self._beat_duration)
-            frac = (elapsed / self._beat_duration) - bn
-            if bn >= 4:
-                self._begin_recording()
-            else:
-                self.rec_lbl.config(text=f"Count-in:  {bn + 1}  of  4")
-                f = render_countdown_frame(
-                    PREVIEW_W, PREVIEW_H, bn + 1, frac, self.bg_color)
-                self._tk_img = ImageTk.PhotoImage(Image.fromarray(f))
-                self.canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
-                self.after(16, self._tick)
-                return
-
-        if self._recording:
-            self.rec_lbl.config(text=self._rec_status)
+        # Automation
+        if self._auto_mode == "write" and self.playing:
+            self._auto_record_tick()
+            n_keys = sum(len(v) for v in self._automation_data.values())
+            self.auto_status_lbl.config(text=f"✎ WRITING · {n_keys} keyframes")
+        elif self._auto_mode == "overdub" and self.playing:
+            self._auto_overdub_tick()
+            n_keys = sum(len(v) for v in self._overdub_buffer.values())
+            self.auto_status_lbl.config(text=f"⊕ OVERDUB · {n_keys} new keyframes")
+        elif self._automation_data and self.playing:
+            self._auto_playback_tick()
+            n_total = sum(len(v) for v in self._automation_data.values())
+            all_t = [kf["t"] for lane in self._automation_data.values() for kf in lane]
+            dur = max(all_t) if all_t else 0
+            self.auto_status_lbl.config(text=f"▶ {n_total} keyframes · {dur:.1f}s")
+        elif self._automation_data:
+            n_total = sum(len(v) for v in self._automation_data.values())
+            all_t = [kf["t"] for lane in self._automation_data.values() for kf in lane]
+            dur = max(all_t) if all_t else 0
+            self.auto_status_lbl.config(text=f"⏸ {n_total} keyframes · {dur:.1f}s")
+        else:
+            self.auto_status_lbl.config(text="No automation")
 
         wall = self._wall_time()
         m = int(wall) // 60
@@ -1235,7 +1363,7 @@ class WaveformApp(tk.Tk):
             "export_duration": self.duration_var.get(),
             "export_format": self.format_var.get(),
             "export_res": self.res_var.get(),
-            "rec_res": self.rec_res_var.get(),
+            "automation": self._automation_data,
             "line_thickness": self.line_thickness.get(),
             "line_glow": self.line_glow.get(),
             "line_bloom": self.line_bloom.get(),
@@ -1282,7 +1410,7 @@ class WaveformApp(tk.Tk):
         self.duration_var.set(p.get("export_duration", 5))
         self.format_var.set(p.get("export_format", "MP4"))
         self.res_var.set(p.get("export_res", "4K (2160×3840)"))
-        self.rec_res_var.set(p.get("rec_res", "1080×1920"))
+        self._automation_data = p.get("automation", {})
         self.line_thickness.set(p.get("line_thickness", 1.0))
         self.line_glow.set(p.get("line_glow", 1.0))
         self.line_bloom.set(p.get("line_bloom", 0.0))
@@ -1353,7 +1481,6 @@ class WaveformApp(tk.Tk):
         if not writer.isOpened():
             self._done("Failed to open video writer.")
             return
-        params = self._build_params()
         samples = self._audio_samples
         trail_buffers = {}
         ts = time.time()
@@ -1367,6 +1494,8 @@ class WaveformApp(tk.Tk):
                 self._done("Export cancelled.")
                 return
             t = i * FRAME_DUR
+            params = self._build_params()
+            self._apply_automation_to_params(params, t)
             frame_rgb = render_frame(ew, eh, t, params, samples, trail_buffers)
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             writer.write(frame_bgr)
