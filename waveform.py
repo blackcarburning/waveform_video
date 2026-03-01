@@ -314,29 +314,22 @@ def compute_waveform(y_norm, t, params, audio_samples=None):
 
 # ─── Rendering ────────────────────────────────────────────────────────────────
 
-_DEST_MAP = {
-    "dest_od": "overdrive",
-    "dest_amp": "base_amplitude",
-    "dest_glow": "line_glow",
-    "dest_bloom": "line_bloom",
-    "dest_trail": "line_trail",
-}
-
-
-def _any_dest_enabled(params):
-    for m in params["modulators"]:
-        for dk in _DEST_MAP:
-            if m.get(dk, False):
-                return True
-    audio_mod = params.get("audio_mod", {})
-    for dk in _DEST_MAP:
-        if audio_mod.get(dk, False):
-            return True
-    return False
-
-
 def compute_param_modulation(t, params, audio_samples=None):
-    """Compute per-frame scalar modulation for rendering parameters."""
+    """
+    Compute per-frame scalar modulation offsets for rendering parameters.
+
+    For each target parameter, checks which modulators (M1-M4, Audio) are
+    routed to it via param_mod_routing, samples those modulators at y=0.5,
+    and returns additive offsets.
+    """
+    routing = params.get("param_mod_routing")
+    if not routing:
+        return {}
+
+    any_enabled = any(any(flags) for flags in routing.values())
+    if not any_enabled:
+        return {}
+
     beat_hz = params["beat_hz"]
     timebase = params["timebase"]
     drift_ratio = params["drift_ratio"]
@@ -344,56 +337,65 @@ def compute_param_modulation(t, params, audio_samples=None):
     temporal_hz = beat_hz * timebase
     drift_hz = beat_hz * drift_ratio * drift_fine
 
-    y_sample = np.array([0.5])  # mid-screen representative scalar
+    y_sample = np.array([0.5])
+
     mod_outputs = compute_modulator_outputs(
         y_sample, t, temporal_hz, drift_hz, params["modulators"], params["xmod"])
+    mod_scalars = [float(mod_outputs[i][0]) for i in range(len(params["modulators"]))]
 
-    destinations = {"overdrive": 0.0, "base_amplitude": 0.0,
-                    "line_glow": 0.0, "line_bloom": 0.0, "line_trail": 0.0}
-
-    for i, m in enumerate(params["modulators"]):
-        if m["depth"] == 0:
-            continue
-        sig_scalar = float(mod_outputs[i][0])
-        for dest_key, param_key in _DEST_MAP.items():
-            if m.get(dest_key, False):
-                destinations[param_key] += m["depth"] * sig_scalar
-
+    audio_scalar = 0.0
     audio_mod = params.get("audio_mod")
     if audio_mod and audio_mod["depth"] > 0 and audio_samples is not None:
-        smoothing = audio_mod["smoothing"]
-        gain = audio_mod["gain"]
-        depth = audio_mod["depth"]
-        envelope_val = compute_audio_envelope(audio_samples, t, smoothing)
-        envelope_val *= gain
-        for dest_key, param_key in _DEST_MAP.items():
-            if audio_mod.get(dest_key, False):
-                destinations[param_key] += depth * envelope_val
+        envelope_val = compute_audio_envelope(audio_samples, t, audio_mod["smoothing"])
+        envelope_val *= audio_mod["gain"]
+        audio_scalar = audio_mod["depth"] * min(1.0, envelope_val)
 
-    return destinations
+    offsets = {}
+    for param_key, flags in routing.items():
+        total = 0.0
+        for i in range(min(4, len(flags))):
+            if flags[i] and i < len(mod_scalars):
+                m = params["modulators"][i]
+                total += m["depth"] * mod_scalars[i]
+        if len(flags) > 4 and flags[4]:
+            total += audio_scalar
+        if total != 0.0:
+            offsets[param_key] = total
+
+    return offsets
 
 
 def render_frame(width, height, t, params, audio_samples=None, trail_buffers=None, output_bgr=False):
     fg = params["fg_color"]
     bg = params["bg_color"]
 
-    if _any_dest_enabled(params):
-        param_mods = compute_param_modulation(t, params, audio_samples)
-        modulated_params = dict(params)
-        modulated_params["overdrive"] = max(0.1, params["overdrive"] + param_mods["overdrive"])  # 0.1: avoid div-by-zero
-        modulated_params["base_amplitude"] = max(0.0, min(1.0, params["base_amplitude"] + param_mods["base_amplitude"]))
-        glow_intensity = max(0.0, params.get("line_glow", 1.0) + param_mods["line_glow"])
-        bloom_amount = max(0.0, params.get("line_bloom", 0.0) + param_mods["line_bloom"])
-        trail_amount = float(np.clip(params.get("line_trail", 0.0) + param_mods["line_trail"], 0.0, 0.95))  # 0.95: avoid infinite persistence
-    else:
-        modulated_params = params
-        glow_intensity = params.get("line_glow", 1.0)
-        bloom_amount = params.get("line_bloom", 0.0)
-        trail_amount = params.get("line_trail", 0.0)
+    param_mods = compute_param_modulation(t, params, audio_samples)
 
     line_thickness_mult = params.get("line_thickness", 1.0)
+    if "line_thickness" in param_mods:
+        line_thickness_mult = max(0.5, line_thickness_mult + param_mods["line_thickness"])
+
+    glow_intensity = params.get("line_glow", 1.0)
+    if "line_glow" in param_mods:
+        glow_intensity = max(0.0, glow_intensity + param_mods["line_glow"])
+
+    bloom_amount = params.get("line_bloom", 0.0)
+    if "line_bloom" in param_mods:
+        bloom_amount = max(0.0, bloom_amount + param_mods["line_bloom"])
+
+    trail_amount = params.get("line_trail", 0.0)
+    if "line_trail" in param_mods:
+        trail_amount = float(np.clip(trail_amount + param_mods["line_trail"], 0.0, 0.95))  # 0.95: avoid infinite persistence
+
+    render_params = params
+    if "overdrive" in param_mods or "amplitude" in param_mods:
+        render_params = dict(params)
+        if "overdrive" in param_mods:
+            render_params["overdrive"] = max(0.1, params["overdrive"] + param_mods["overdrive"])  # 0.1: avoid div-by-zero
+        if "amplitude" in param_mods:
+            render_params["base_amplitude"] = max(0.0, min(1.0, params["base_amplitude"] + param_mods["amplitude"]))
     y_norm = np.linspace(0, 1, height)
-    wave = compute_waveform(y_norm, t, modulated_params, audio_samples)
+    wave = compute_waveform(y_norm, t, render_params, audio_samples)
     margin = width * 0.04
     centre = width / 2.0
     usable = (width - 2 * margin) / 2.0
@@ -503,7 +505,7 @@ class BPMEntry(tk.Entry):
 
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 
-PREVIEW_W, PREVIEW_H = 270, 480
+PREVIEW_W, PREVIEW_H = 300, 480
 
 
 class WaveformApp(tk.Tk):
@@ -533,6 +535,15 @@ class WaveformApp(tk.Tk):
 
         self._trail_buffers = {}
 
+        self.param_mod_routing = {
+            "amplitude":      [tk.BooleanVar(value=False) for _ in range(5)],
+            "overdrive":      [tk.BooleanVar(value=False) for _ in range(5)],
+            "line_thickness": [tk.BooleanVar(value=False) for _ in range(5)],
+            "line_glow":      [tk.BooleanVar(value=False) for _ in range(5)],
+            "line_bloom":     [tk.BooleanVar(value=False) for _ in range(5)],
+            "line_trail":     [tk.BooleanVar(value=False) for _ in range(5)],
+        }
+
         self._build_ui()
         self._tick()
 
@@ -543,7 +554,7 @@ class WaveformApp(tk.Tk):
             s.configure(w, background="#111111")
         s.configure("TLabel", foreground="#cccccc", font=("Consolas", 9))
         s.configure("TCheckbutton", foreground="#cccccc", font=("Consolas", 8))
-        s.configure("Dest.TCheckbutton", foreground="#aaccff", font=("Consolas", 7))
+        s.configure("Route.TCheckbutton", foreground="#888888", font=("Consolas", 7), background="#111111")
         s.configure("Header.TLabel", foreground="#ffffff", font=("Consolas", 11, "bold"), background="#111111")
         s.configure("Hz.TLabel", foreground="#66bbff", font=("Consolas", 8), background="#111111")
         s.configure("OD.TLabel", foreground="#ff5555", font=("Consolas", 9, "bold"), background="#111111")
@@ -651,8 +662,8 @@ class WaveformApp(tk.Tk):
         self.base_hz_lbl = ttk.Label(bwr, text="", style="Hz.TLabel")
         self.base_hz_lbl.pack(side="left")
 
-        self._add_slider(bf, "Amplitude", 0.0, 1.0, 0.4, "amplitude")
-        self._add_slider(bf, "Mod OD", 1.0, 5.0, 3.0, "overdrive")
+        self._add_slider(bf, "Amplitude", 0.0, 1.0, 0.4, "amplitude", mod_route_key="amplitude")
+        self._add_slider(bf, "Mod OD", 1.0, 5.0, 3.0, "overdrive", mod_route_key="overdrive")
 
         # Drift
         dr = ttk.Frame(bf)
@@ -685,10 +696,10 @@ class WaveformApp(tk.Tk):
         # ── Line Style ───────────────────────────────────────────────────
         lsf = ttk.LabelFrame(col_left, text="LINE STYLE")
         lsf.pack(fill="x", pady=(0, 4))
-        self._add_slider(lsf, "Thickness", 0.5, 6.0, 1.0, "line_thickness")
-        self._add_slider(lsf, "Glow",      0.0, 2.0, 1.0, "line_glow")
-        self._add_slider(lsf, "Bloom",     0.0, 3.0, 0.0, "line_bloom")
-        self._add_slider(lsf, "Trail",     0.0, 0.95, 0.0, "line_trail")
+        self._add_slider(lsf, "Thickness", 0.5, 6.0, 1.0, "line_thickness", mod_route_key="line_thickness")
+        self._add_slider(lsf, "Glow",      0.0, 2.0, 1.0, "line_glow", mod_route_key="line_glow")
+        self._add_slider(lsf, "Bloom",     0.0, 3.0, 0.0, "line_bloom", mod_route_key="line_bloom")
+        self._add_slider(lsf, "Trail",     0.0, 0.95, 0.0, "line_trail", mod_route_key="line_trail")
 
         # ── Patch ────────────────────────────────────────────────────────
         pf = ttk.LabelFrame(col_left, text="PATCH")
@@ -737,16 +748,6 @@ class WaveformApp(tk.Tk):
                 row_vars.append(bv)
             self.xmod_vars.append(row_vars)
 
-            drow = ttk.Frame(mf)
-            drow.pack(fill="x", padx=2, pady=(0, 2))
-            ttk.Label(drow, text="Dest →", font=("Consolas", 8)).pack(side="left", padx=(0, 4))
-            for dest_key, dest_label in (("dest_od", "OD"), ("dest_amp", "Amp"),
-                                         ("dest_glow", "Glow"), ("dest_bloom", "Bloom"),
-                                         ("dest_trail", "Trail")):
-                mv[dest_key] = tk.BooleanVar(value=False)
-                ttk.Checkbutton(drow, text=dest_label, variable=mv[dest_key],
-                                style="Dest.TCheckbutton").pack(side="left", padx=2)
-
             self.mod_vars.append(mv)
 
         # ── Audio Modulator ──────────────────────────────────────────────
@@ -775,16 +776,6 @@ class WaveformApp(tk.Tk):
         ttk.Label(amf, text="Smooth = envelope speed · Gain = input boost",
                   font=("Consolas", 7), foreground="#666666",
                   background="#111111").pack(fill="x", padx=4, pady=(0, 2))
-
-        am_drow = ttk.Frame(amf)
-        am_drow.pack(fill="x", padx=4, pady=(0, 2))
-        ttk.Label(am_drow, text="Dest →", font=("Consolas", 8)).pack(side="left", padx=(0, 4))
-        for dest_attr, dest_label in (("audio_mod_dest_od", "OD"), ("audio_mod_dest_amp", "Amp"),
-                                      ("audio_mod_dest_glow", "Glow"), ("audio_mod_dest_bloom", "Bloom"),
-                                      ("audio_mod_dest_trail", "Trail")):
-            setattr(self, dest_attr, tk.BooleanVar(value=False))
-            ttk.Checkbutton(am_drow, text=dest_label, variable=getattr(self, dest_attr),
-                            style="Dest.TCheckbutton").pack(side="left", padx=2)
 
         # Audio inject row
         ai_r0 = ttk.Frame(amf)
@@ -872,17 +863,25 @@ class WaveformApp(tk.Tk):
 
     # ── Slider helpers ───────────────────────────────────────────────────
 
-    def _add_slider(self, parent, label, lo, hi, default, attr):
+    def _add_slider(self, parent, label, lo, hi, default, attr, mod_route_key=None):
         r = ttk.Frame(parent)
         r.pack(fill="x", padx=4, pady=1)
         ttk.Label(r, text=label, width=9).pack(side="left")
         var = tk.DoubleVar(value=default)
         setattr(self, attr, var)
         ttk.Scale(r, from_=lo, to=hi, variable=var,
-                  orient="horizontal", length=160).pack(side="left", padx=(0, 4))
-        lbl = ttk.Label(r, text=f"{default:.2f}", width=6)
+                  orient="horizontal", length=120).pack(side="left", padx=(0, 4))
+        lbl = ttk.Label(r, text=f"{default:.2f}", width=5)
         lbl.pack(side="left")
         setattr(self, f"_{attr}_lbl", lbl)
+
+        if mod_route_key and mod_route_key in self.param_mod_routing:
+            ttk.Label(r, text="│", font=("Consolas", 7), foreground="#444444",
+                      background="#111111").pack(side="left", padx=(2, 2))
+            route_vars = self.param_mod_routing[mod_route_key]
+            for idx, name in enumerate(["M1", "M2", "M3", "M4", "Au"]):
+                ttk.Checkbutton(r, text=name, variable=route_vars[idx],
+                                style="Route.TCheckbutton").pack(side="left", padx=1)
 
     def _mod_slider(self, parent, label, lo, hi, default, store, key):
         r = ttk.Frame(parent)
@@ -1083,11 +1082,6 @@ class WaveformApp(tk.Tk):
                     "ratio": RATIO_VALUES.get(m["ratio"].get(), 1.0),
                     "depth": m["depth"].get(),
                     "amplitude": m["amp"].get(),
-                    "dest_od": m["dest_od"].get(),
-                    "dest_amp": m["dest_amp"].get(),
-                    "dest_glow": m["dest_glow"].get(),
-                    "dest_bloom": m["dest_bloom"].get(),
-                    "dest_trail": m["dest_trail"].get(),
                 }
                 for m in self.mod_vars
             ],
@@ -1097,11 +1091,6 @@ class WaveformApp(tk.Tk):
                 "depth": self.audio_mod_depth.get() if self.audio_mod_enabled.get() else 0.0,
                 "gain": self.audio_mod_gain.get(),
                 "smoothing": self.audio_mod_smoothing.get(),
-                "dest_od": self.audio_mod_dest_od.get(),
-                "dest_amp": self.audio_mod_dest_amp.get(),
-                "dest_glow": self.audio_mod_dest_glow.get(),
-                "dest_bloom": self.audio_mod_dest_bloom.get(),
-                "dest_trail": self.audio_mod_dest_trail.get(),
             },
             "audio_inject": {
                 "enabled": self.audio_inject_enabled.get(),
@@ -1113,6 +1102,10 @@ class WaveformApp(tk.Tk):
             "line_glow": self.line_glow.get(),
             "line_bloom": self.line_bloom.get(),
             "line_trail": self.line_trail.get(),
+            "param_mod_routing": {
+                key: [v.get() for v in vars_list]
+                for key, vars_list in self.param_mod_routing.items()
+            },
         }
 
     # ── Automation ───────────────────────────────────────────────────────
@@ -1459,11 +1452,6 @@ class WaveformApp(tk.Tk):
                     "depth": mv["depth"].get(),
                     "amp": mv["amp"].get(),
                     "xmod": [self.xmod_vars[i][j].get() for j in range(4)],
-                    "dest_od": mv["dest_od"].get(),
-                    "dest_amp": mv["dest_amp"].get(),
-                    "dest_glow": mv["dest_glow"].get(),
-                    "dest_bloom": mv["dest_bloom"].get(),
-                    "dest_trail": mv["dest_trail"].get(),
                 }
                 for i, mv in enumerate(self.mod_vars)
             ],
@@ -1473,11 +1461,6 @@ class WaveformApp(tk.Tk):
                 "gain": self.audio_mod_gain.get(),
                 "smoothing": self.audio_mod_smoothing.get(),
                 "enabled": self.audio_mod_enabled.get(),
-                "dest_od": self.audio_mod_dest_od.get(),
-                "dest_amp": self.audio_mod_dest_amp.get(),
-                "dest_glow": self.audio_mod_dest_glow.get(),
-                "dest_bloom": self.audio_mod_dest_bloom.get(),
-                "dest_trail": self.audio_mod_dest_trail.get(),
             },
             "audio_inject": {
                 "enabled": self.audio_inject_enabled.get(),
@@ -1492,6 +1475,10 @@ class WaveformApp(tk.Tk):
             "line_glow": self.line_glow.get(),
             "line_bloom": self.line_bloom.get(),
             "line_trail": self.line_trail.get(),
+            "param_mod_routing": {
+                key: [v.get() for v in vars_list]
+                for key, vars_list in self.param_mod_routing.items()
+            },
         }
 
     def _apply_patch(self, p):
@@ -1520,11 +1507,6 @@ class WaveformApp(tk.Tk):
             for j in range(4):
                 if j != i:
                     self.xmod_vars[i][j].set(xm[j] if j < len(xm) else False)
-            mv["dest_od"].set(md.get("dest_od", False))
-            mv["dest_amp"].set(md.get("dest_amp", False))
-            mv["dest_glow"].set(md.get("dest_glow", False))
-            mv["dest_bloom"].set(md.get("dest_bloom", False))
-            mv["dest_trail"].set(md.get("dest_trail", False))
         am = p.get("audio_mod", {})
         self.audio_mod_type.set(am.get("type", "AM"))
         self.audio_mod_depth.set(am.get("depth", 0.0))
@@ -1532,11 +1514,6 @@ class WaveformApp(tk.Tk):
         self.audio_mod_smoothing.set(am.get("smoothing", 0.05))
         self.audio_mod_enabled.set(am.get("enabled", False))
         self._update_audio_mod_btn()
-        self.audio_mod_dest_od.set(am.get("dest_od", False))
-        self.audio_mod_dest_amp.set(am.get("dest_amp", False))
-        self.audio_mod_dest_glow.set(am.get("dest_glow", False))
-        self.audio_mod_dest_bloom.set(am.get("dest_bloom", False))
-        self.audio_mod_dest_trail.set(am.get("dest_trail", False))
         ai = p.get("audio_inject", {})
         self.audio_inject_enabled.set(ai.get("enabled", False))
         self.audio_inject_amp.set(ai.get("amplitude", 0.0))
@@ -1549,6 +1526,11 @@ class WaveformApp(tk.Tk):
         self.line_glow.set(p.get("line_glow", 1.0))
         self.line_bloom.set(p.get("line_bloom", 0.0))
         self.line_trail.set(p.get("line_trail", 0.0))
+        routing = p.get("param_mod_routing", {})
+        for key, vars_list in self.param_mod_routing.items():
+            saved = routing.get(key, [False] * 5)
+            for i, var in enumerate(vars_list):
+                var.set(saved[i] if i < len(saved) else False)
         ap = p.get("audio_path")
         if ap and os.path.isfile(ap):
             self._load_audio(ap)
