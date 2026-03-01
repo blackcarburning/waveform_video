@@ -16,6 +16,7 @@ import tkinter as tk
 from tkinter import ttk, colorchooser, filedialog, messagebox
 import numpy as np
 import threading
+import multiprocessing
 import os
 import time
 import io
@@ -387,7 +388,7 @@ def compute_param_modulation(t, params, audio_samples=None):
     return offsets
 
 
-def render_frame(width, height, t, params, audio_samples=None, trail_buffers=None, output_bgr=False):
+def render_frame(width, height, t, params, audio_samples=None, trail_buffers=None, output_bgr=False, precomputed=None):
     fg = params["fg_color"]
     bg = params["bg_color"]
 
@@ -419,7 +420,7 @@ def render_frame(width, height, t, params, audio_samples=None, trail_buffers=Non
     if any(f"mod{i}_depth" in param_mods or f"mod{i}_amp" in param_mods for i in range(4)):
         if render_params is params:
             render_params = dict(params)
-        render_params["modulators"] = copy.deepcopy(params["modulators"])
+        render_params["modulators"] = [dict(m) for m in params["modulators"]]
         for i in range(min(4, len(render_params["modulators"]))):
             if f"mod{i}_depth" in param_mods:
                 render_params["modulators"][i]["depth"] = max(0.0,
@@ -427,7 +428,10 @@ def render_frame(width, height, t, params, audio_samples=None, trail_buffers=Non
             if f"mod{i}_amp" in param_mods:
                 render_params["modulators"][i]["amplitude"] = max(0.0,
                     params["modulators"][i]["amplitude"] + param_mods[f"mod{i}_amp"])
-    y_norm = np.linspace(0, 1, height)
+    if precomputed is not None:
+        y_norm = precomputed["y_norm"]
+    else:
+        y_norm = np.linspace(0, 1, height)
     wave = compute_waveform(y_norm, t, render_params, audio_samples)
     margin = width * 0.04
     centre = width / 2.0
@@ -436,7 +440,11 @@ def render_frame(width, height, t, params, audio_samples=None, trail_buffers=Non
     img = np.full((height, width, 3), (bg[2], bg[1], bg[0]), dtype=np.uint8)
     scale = height / REF_H
     thickness = max(1, round(scale * line_thickness_mult))
-    pts = np.stack([xs.astype(np.float32), np.arange(height, dtype=np.float32)], axis=1)
+    if precomputed is not None:
+        y_arange = precomputed["y_arange"]
+    else:
+        y_arange = np.arange(height, dtype=np.float32)
+    pts = np.stack([xs.astype(np.float32), y_arange], axis=1)
     pts = pts.reshape((-1, 1, 2))
     pts_fixed = np.round(pts * 16).astype(np.int32)
     fg_bgr = (int(fg[2]), int(fg[1]), int(fg[0]))
@@ -515,7 +523,7 @@ def render_frame_gpu(width, height, t, params, audio_samples=None, trail_buffers
     if any(f"mod{i}_depth" in param_mods or f"mod{i}_amp" in param_mods for i in range(4)):
         if render_params is params:
             render_params = dict(params)
-        render_params["modulators"] = copy.deepcopy(params["modulators"])
+        render_params["modulators"] = [dict(m) for m in params["modulators"]]
         for i in range(min(4, len(render_params["modulators"]))):
             if f"mod{i}_depth" in param_mods:
                 render_params["modulators"][i]["depth"] = max(0.0,
@@ -589,6 +597,42 @@ def render_frame_gpu(width, height, t, params, audio_samples=None, trail_buffers
         gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2RGB)
         img = gpu_img.download()
     return img
+
+
+# ─── Export Helpers ──────────────────────────────────────────────────────────
+
+# Per-worker globals set by the pool initializer
+_worker_samples = None
+_worker_precomputed = None
+
+
+def _init_export_worker(samples, precomputed):
+    """Pool initializer: store audio samples and pre-computed arrays once per worker process."""
+    global _worker_samples, _worker_precomputed
+    _worker_samples = samples
+    _worker_precomputed = precomputed
+
+
+def _render_frame_worker(args):
+    """Top-level picklable worker: render one frame without trail (trail is composited sequentially)."""
+    width, height, t, params = args
+    return render_frame(width, height, t, params, _worker_samples,
+                        trail_buffers=None, output_bgr=True,
+                        precomputed=_worker_precomputed)
+
+
+def _shallow_copy_params(params):
+    """Fast copy of params dict — avoids copy.deepcopy overhead."""
+    p = dict(params)
+    p["modulators"] = [dict(m) for m in params["modulators"]]
+    p["xmod"] = [list(row) for row in params["xmod"]]
+    if "audio_mod" in params:
+        p["audio_mod"] = dict(params["audio_mod"])
+    if "audio_inject" in params:
+        p["audio_inject"] = dict(params["audio_inject"])
+    if "param_mod_routing" in params:
+        p["param_mod_routing"] = {k: list(v) for k, v in params["param_mod_routing"].items()}
+    return p
 
 
 # ─── BPM Entry ───────────────────────────────────────────────────────────────
@@ -1960,42 +2004,74 @@ class WaveformApp(tk.Tk):
             self._done("Failed to open video writer.")
             return
 
-        # Choose renderer: GPU if available, else CPU
-        renderer = render_frame_gpu if HAS_CUDA else render_frame
-
         # Build base params ONCE (thread-safe snapshot)
         base_params = self._build_params()
         has_automation = bool(self._automation_data)
         samples = self._audio_samples
         trail_buffers = {}
+        trail_amount = base_params.get("line_trail", 0.0)
+
+        # Pre-compute reusable arrays sent once to each worker via the initializer
+        precomputed = {
+            "y_norm": np.linspace(0, 1, eh),
+            "y_arange": np.arange(eh, dtype=np.float32),
+        }
+
+        n_workers = os.cpu_count() or 1
+        # 2× worker count keeps the pool fed without holding too many frames in memory at once
+        batch_size = n_workers * 2
         ts = time.time()
-        for i in range(total):
-            if self._export_cancel:
-                writer.release()
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-                self._done("Export cancelled.")
-                return
-            t = i * FRAME_DUR
-            # Deep-copy modulators only when automation is present
-            if has_automation:
-                frame_params = copy.deepcopy(base_params)
-                self._apply_automation_to_params(frame_params, t)
-            else:
-                frame_params = base_params
-            # output_bgr=True skips the BGR→RGB→BGR round-trip
-            frame_bgr = renderer(ew, eh, t, frame_params, samples,
-                                 trail_buffers, output_bgr=True)
-            writer.write(frame_bgr)
-            pct = (i + 1) / total * 100
-            self.progress.set(pct)
-            el = time.time() - ts
-            if i > 0 and (i % 30 == 0 or i == total - 1):  # batch UI updates every 30 frames
-                eta = el / (i + 1) * (total - i - 1)
-                self.after(0, lambda p=pct, e=eta: self.progress_lbl.config(
-                    text=f"{p:.0f}% · ETA {e:.0f}s · {ew}×{eh}"))
+
+        with multiprocessing.Pool(
+            processes=n_workers,
+            initializer=_init_export_worker,
+            initargs=(samples, precomputed),
+        ) as pool:
+            i = 0
+            while i < total:
+                if self._export_cancel:
+                    pool.terminate()
+                    writer.release()
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                    self._done("Export cancelled.")
+                    return
+
+                # Build per-frame params for this batch in the main thread
+                batch_end = min(i + batch_size, total)
+                batch_args = []
+                for j in range(i, batch_end):
+                    t_frame = j * FRAME_DUR
+                    if has_automation:
+                        frame_params = _shallow_copy_params(base_params)
+                        self._apply_automation_to_params(frame_params, t_frame)
+                    else:
+                        frame_params = base_params
+                    batch_args.append((ew, eh, t_frame, frame_params))
+
+                # Render batch in parallel (no trail)
+                frames = pool.map(_render_frame_worker, batch_args)
+
+                # Sequential trail compositing and write
+                for frame_bgr in frames:
+                    if trail_amount > 0:
+                        key = (ew, eh)
+                        if key in trail_buffers:
+                            frame_bgr = cv2.addWeighted(frame_bgr, 1.0, trail_buffers[key], trail_amount, 0)
+                        trail_buffers[key] = frame_bgr.copy()
+                    writer.write(frame_bgr)
+
+                i = batch_end
+                pct = i / total * 100
+                self.progress.set(pct)
+                el = time.time() - ts
+                if i > 0:
+                    eta = el / i * (total - i)
+                    self.after(0, lambda p=pct, e=eta: self.progress_lbl.config(
+                        text=f"{p:.0f}% · ETA {e:.0f}s · {ew}×{eh}"))
+
         writer.release()
         fsize = os.path.getsize(path) / (1024 * 1024)
         self._done(f"Saved: {path}\n{ew}×{eh} · {dur}s · {fmt} · {fsize:.1f} MB")
