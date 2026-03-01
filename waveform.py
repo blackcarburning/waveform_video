@@ -1209,6 +1209,15 @@ class WaveformApp(tk.Tk):
         """Called from _tick() when recording automation."""
         t = self._wall_time()
         params = self._get_automatable_params()
+        snap_val = params["active_snapshot"].get()
+        snap_lane = self._automation_data.get("active_snapshot", [])
+        snap_is_changing = bool(snap_lane) and abs(snap_lane[-1]["v"] - snap_val) > 1e-6
+        if snap_is_changing:
+            # Snapshot switched this tick: only record active_snapshot.
+            # The snapshot recall sets all other params, so individual lanes
+            # would create redundant and conflicting keyframe data.
+            snap_lane.append({"t": t, "v": snap_val})
+            return
         for key, var in params.items():
             val = var.get()
             lane = self._automation_data.setdefault(key, [])
@@ -1229,12 +1238,22 @@ class WaveformApp(tk.Tk):
         """Called from _tick() when playing back automation."""
         t = self._wall_time()
         params = self._get_automatable_params()
+        snap_lane = self._automation_data.get("active_snapshot", [])
+        if snap_lane:
+            # Snapshot automation is active: apply it (step/hold) and skip all
+            # individual parameter lanes.  The snapshot recall triggered by
+            # _on_snapshot_select already sets every parameter value, so playing
+            # back the individual lanes would only cause linear-interpolation
+            # artifacts that fight the instant snapshot switch.
+            val = self._step_lane(snap_lane, t)
+            if val is not None:
+                params["active_snapshot"].set(int(round(val)))
+            return
         for key, var in params.items():
             lane = self._automation_data.get(key, [])
             if not lane:
                 continue
             if key == "active_snapshot":
-                # Step/hold: use the most recent keyframe value, no interpolation
                 val = self._step_lane(lane, t)
                 if val is not None:
                     var.set(int(round(val)))
