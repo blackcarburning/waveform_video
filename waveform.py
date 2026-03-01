@@ -8,8 +8,7 @@ Vertical Oscilloscope Waveform Generator v15
 • 4 synth modulators (AM/FM) with cross-mod
 • Modulators exceed base amplitude via Overdrive
 • Audio monitoring via pygame
-• Live recording to AVI with 4-beat count-in
-• Offline export to MP4/AVI at 1080×1920 or 4K
+• Offline export to MP4/AVI at 720p, 1080p or 4K (CUDA-accelerated when available)
 • Patch save/load (JSON)
 """
 
@@ -47,6 +46,11 @@ try:
     HAS_PYDUB = True
 except ImportError:
     HAS_PYDUB = False
+
+try:
+    HAS_CUDA = cv2.cuda.getCudaEnabledDeviceCount() > 0
+except AttributeError:
+    HAS_CUDA = False
 
 
 # ─── Tables ──────────────────────────────────────────────────────────────────
@@ -164,6 +168,21 @@ def compute_audio_envelope(samples, t, smoothing):
     rms = np.sqrt(np.mean(chunk ** 2))
     return min(1.0, rms * 3.0)
 
+# Cache for pre-computed audio cumsum (keyed by id of samples array)
+_audio_cumsum_cache: dict = {}
+
+
+def _get_audio_cumsum(samples):
+    """Return cached cumulative sum of squares for the given samples array."""
+    key = id(samples)
+    if key not in _audio_cumsum_cache:
+        sq = samples.astype(np.float64) ** 2
+        cs = np.empty(len(samples) + 1, dtype=np.float64)
+        cs[0] = 0.0
+        np.cumsum(sq, out=cs[1:])
+        _audio_cumsum_cache[key] = cs
+    return _audio_cumsum_cache[key]
+
 
 def compute_audio_envelope_array(samples, t, smoothing, n_points):
     """
@@ -184,11 +203,7 @@ def compute_audio_envelope_array(samples, t, smoothing, n_points):
     ends = np.clip(centres + half_win, 0, n_samples)
     lengths = ends - starts
 
-    # Cumulative sum of squares for O(1) RMS per window
-    sq = samples.astype(np.float64) ** 2
-    cumsum = np.empty(n_samples + 1, dtype=np.float64)
-    cumsum[0] = 0.0
-    np.cumsum(sq, out=cumsum[1:])
+    cumsum = _get_audio_cumsum(samples)
 
     window_sums = cumsum[ends] - cumsum[starts]
     valid = lengths > 0
@@ -459,20 +474,120 @@ def render_frame(width, height, t, params, audio_samples=None, trail_buffers=Non
     return img
 
 
-def render_countdown_frame(width, height, beat_number, fraction, bg_color):
-    img = np.full((height, width, 3), (bg_color[2], bg_color[1], bg_color[0]), dtype=np.uint8)
-    brightness = max(0.0, 1.0 - fraction * 3.0)
-    if brightness > 0:
-        cv2.add(img, np.full_like(img, int(brightness * 60)), img)
-    sf = height / REF_H
-    fs = 4.0 * sf
-    th = max(2, int(3 * sf))
-    text = str(beat_number)
-    (tw, txh), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
-    x, y = (width - tw) // 2, (height + txh) // 2
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs, (80, 80, 80), th*3, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th, cv2.LINE_AA)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+def render_frame_gpu(width, height, t, params, audio_samples=None, trail_buffers=None, output_bgr=False):
+    """GPU-accelerated version of render_frame using cv2.cuda when HAS_CUDA is True.
+
+    The waveform/numpy computation stays on CPU; all OpenCV post-processing
+    (glow blend, bloom, trail, colour conversion) runs on the GPU.
+    Falls back to render_frame() transparently if CUDA is unavailable.
+    """
+    if not HAS_CUDA:
+        return render_frame(width, height, t, params, audio_samples, trail_buffers, output_bgr)
+
+    fg = params["fg_color"]
+    bg = params["bg_color"]
+
+    param_mods = compute_param_modulation(t, params, audio_samples)
+
+    line_thickness_mult = params.get("line_thickness", 1.0)
+    if "line_thickness" in param_mods:
+        line_thickness_mult = max(0.5, line_thickness_mult + param_mods["line_thickness"])
+
+    glow_intensity = params.get("line_glow", 1.0)
+    if "line_glow" in param_mods:
+        glow_intensity = max(0.0, glow_intensity + param_mods["line_glow"])
+
+    bloom_amount = params.get("line_bloom", 0.0)
+    if "line_bloom" in param_mods:
+        bloom_amount = max(0.0, bloom_amount + param_mods["line_bloom"])
+
+    trail_amount = params.get("line_trail", 0.0)
+    if "line_trail" in param_mods:
+        trail_amount = float(np.clip(trail_amount + param_mods["line_trail"], 0.0, 0.95))
+
+    render_params = params
+    if "overdrive" in param_mods or "amplitude" in param_mods:
+        render_params = dict(params)
+        if "overdrive" in param_mods:
+            render_params["overdrive"] = max(0.1, params["overdrive"] + param_mods["overdrive"])
+        if "amplitude" in param_mods:
+            render_params["base_amplitude"] = max(0.0, min(1.0, params["base_amplitude"] + param_mods["amplitude"]))
+    if any(f"mod{i}_depth" in param_mods or f"mod{i}_amp" in param_mods for i in range(4)):
+        if render_params is params:
+            render_params = dict(params)
+        render_params["modulators"] = copy.deepcopy(params["modulators"])
+        for i in range(min(4, len(render_params["modulators"]))):
+            if f"mod{i}_depth" in param_mods:
+                render_params["modulators"][i]["depth"] = max(0.0,
+                    params["modulators"][i]["depth"] + param_mods[f"mod{i}_depth"])
+            if f"mod{i}_amp" in param_mods:
+                render_params["modulators"][i]["amplitude"] = max(0.0,
+                    params["modulators"][i]["amplitude"] + param_mods[f"mod{i}_amp"])
+
+    y_norm = np.linspace(0, 1, height)
+    wave = compute_waveform(y_norm, t, render_params, audio_samples)
+    margin = width * 0.04
+    centre = width / 2.0
+    usable = (width - 2 * margin) / 2.0
+    xs = centre + wave * usable
+    img = np.full((height, width, 3), (bg[2], bg[1], bg[0]), dtype=np.uint8)
+    scale = height / REF_H
+    thickness = max(1, round(scale * line_thickness_mult))
+    pts = np.stack([xs.astype(np.float32), np.arange(height, dtype=np.float32)], axis=1)
+    pts = pts.reshape((-1, 1, 2))
+    pts_fixed = np.round(pts * 16).astype(np.int32)
+    fg_bgr = (int(fg[2]), int(fg[1]), int(fg[0]))
+
+    # CPU: polylines (no CUDA equivalent)
+    cv2.polylines(img, [pts_fixed], False, fg_bgr, thickness, cv2.LINE_AA, shift=4)
+    if thickness >= 2 and glow_intensity > 0:
+        glow = np.zeros_like(img)
+        cv2.polylines(glow, [pts_fixed], False, fg_bgr, thickness * 3, cv2.LINE_AA, shift=4)
+        # Upload to GPU for blending
+        gpu_img = cv2.cuda_GpuMat()
+        gpu_img.upload(img)
+        gpu_glow = cv2.cuda_GpuMat()
+        gpu_glow.upload(glow)
+        cv2.cuda.addWeighted(gpu_img, 1.0, gpu_glow, 0.3 * glow_intensity, 0, gpu_img)
+        glow[:] = 0
+        cv2.polylines(glow, [pts_fixed], False, fg_bgr, thickness * 2, cv2.LINE_AA, shift=4)
+        gpu_glow.upload(glow)
+        cv2.cuda.addWeighted(gpu_img, 1.0, gpu_glow, 0.25 * glow_intensity, 0, gpu_img)
+        img = gpu_img.download()
+    cv2.polylines(img, [pts_fixed], False, fg_bgr, thickness, cv2.LINE_AA, shift=4)
+    if thickness >= 3:
+        core_bgr = (min(255, int(fg[2])+120), min(255, int(fg[1])+120), min(255, int(fg[0])+120))
+        cv2.polylines(img, [pts_fixed], False, core_bgr, max(1, thickness//3), cv2.LINE_AA, shift=4)
+
+    # GPU: bloom
+    if bloom_amount > 0:
+        ksize = max(3, int(scale * bloom_amount * 30) | 1)
+        gpu_img = cv2.cuda_GpuMat()
+        gpu_img.upload(img)
+        gauss_filter = cv2.cuda.createGaussianFilter(
+            cv2.CV_8UC3, cv2.CV_8UC3, (ksize, ksize), 0)
+        gpu_blurred = gauss_filter.apply(gpu_img)
+        cv2.cuda.addWeighted(gpu_img, 1.0, gpu_blurred, bloom_amount * 0.4, 0, gpu_img)
+        img = gpu_img.download()
+
+    # GPU: trail
+    if trail_amount > 0 and trail_buffers is not None:
+        key = (width, height)
+        if key in trail_buffers:
+            prev = trail_buffers[key]
+            gpu_img = cv2.cuda_GpuMat()
+            gpu_img.upload(img)
+            gpu_prev = cv2.cuda_GpuMat()
+            gpu_prev.upload(prev)
+            cv2.cuda.addWeighted(gpu_img, 1.0, gpu_prev, trail_amount, 0, gpu_img)
+            img = gpu_img.download()
+        trail_buffers[key] = img.copy()
+
+    if not output_bgr:
+        gpu_img = cv2.cuda_GpuMat()
+        gpu_img.upload(img)
+        gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2RGB)
+        img = gpu_img.download()
     return img
 
 
@@ -553,15 +668,6 @@ class WaveformApp(tk.Tk):
 
         self._trail_buffers = {}
 
-        self._rec_writer = None
-        self._rec_path = None
-        self._recording = False
-        self._rec_countin = False
-        self._rec_countin_beat = 0
-        self._rec_countin_t0 = 0.0
-        self._rec_start_t = 0.0
-        self._rec_trail_buffers = {}
-
         self._snapshots: list[dict | None] = [None] * 8
         self._active_snapshot = tk.IntVar(value=-1)
         self._snapshots_locked = tk.BooleanVar(value=False)
@@ -627,22 +733,8 @@ class WaveformApp(tk.Tk):
         self.play_btn = ttk.Button(br, text="▶  PLAY", command=self._play, width=10)
         self.play_btn.pack(side="left", padx=(0, 4))
         ttk.Button(br, text="⏹  STOP", command=self._stop, width=10).pack(side="left", padx=(0, 4))
-        self.rec_btn = tk.Button(
-            br, text="⏺ REC",
-            bg="#333333", fg="#cccccc", activebackground="#333333",
-            relief="raised", bd=1, padx=4, pady=1,
-            command=self._toggle_rec, width=9)
-        self.rec_btn.pack(side="left", padx=(0, 8))
         self.time_lbl = ttk.Label(br, text="00:00.000", style="Time.TLabel")
         self.time_lbl.pack(side="left", padx=4)
-
-        rr = ttk.Frame(tp)
-        rr.pack(fill="x", padx=4, pady=(0, 2))
-        ttk.Label(rr, text="Records preview at 1080×1920 · video only",
-                  font=("Consolas", 7), foreground="#666666",
-                  background="#111111").pack(side="left")
-        self.rec_lbl = ttk.Label(rr, text="", style="Rec.TLabel")
-        self.rec_lbl.pack(side="left", padx=(8, 0))
 
         tbr = ttk.Frame(tp)
         tbr.pack(fill="x", padx=4, pady=(0, 3))
@@ -920,9 +1012,9 @@ class WaveformApp(tk.Tk):
         ttk.Combobox(er0, textvariable=self.format_var, values=["MP4", "AVI"],
                      state="readonly", width=5).pack(side="left", padx=(0, 8))
         ttk.Label(er0, text="Res").pack(side="left", padx=(0, 4))
-        self.res_var = tk.StringVar(value="4K (2160×3840)")
+        self.res_var = tk.StringVar(value="1080×1920")
         ttk.Combobox(er0, textvariable=self.res_var,
-                     values=["1080×1920", "4K (2160×3840)"],
+                     values=["720×1280", "1080×1920", "4K (2160×3840)"],
                      state="readonly", width=14).pack(side="left")
 
         er1 = ttk.Frame(ef)
@@ -932,6 +1024,9 @@ class WaveformApp(tk.Tk):
         self.cancel_btn = ttk.Button(er1, text="Cancel", command=self._cancel_export,
                                      state="disabled")
         self.cancel_btn.pack(side="left")
+        gpu_text = "🟢 CUDA" if HAS_CUDA else "⚪ CPU"
+        ttk.Label(er1, text=gpu_text, font=("Consolas", 8),
+                  foreground="#888888", background="#111111").pack(side="left", padx=(10, 0))
 
         self.progress = tk.DoubleVar(value=0)
         ttk.Progressbar(ef, variable=self.progress, maximum=100,
@@ -1156,62 +1251,6 @@ class WaveformApp(tk.Tk):
             self._auto_stop_write()
         elif self._auto_mode == "overdub":
             self._auto_stop_overdub()
-        if self._recording or self._rec_countin:
-            self._stop_rec()
-
-    # ── Real-time Recording ──────────────────────────────────────────────
-
-    def _toggle_rec(self):
-        if self._recording or self._rec_countin:
-            self._stop_rec()
-        else:
-            self._start_rec()
-
-    def _start_rec(self):
-        fmt = self.format_var.get()
-        ext = ".mp4" if fmt == "MP4" else ".avi"
-        ftypes = [(fmt, f"*{ext}")]
-        path = filedialog.asksaveasfilename(defaultextension=ext, filetypes=ftypes)
-        if not path:
-            return
-        cc = "MJPG" if fmt == "AVI" else "mp4v"
-        fourcc = cv2.VideoWriter_fourcc(*cc)
-        writer = cv2.VideoWriter(path, fourcc, FPS, (1080, 1920))
-        if not writer.isOpened():
-            messagebox.showerror("Error", "Failed to open video writer.")
-            return
-        self._rec_writer = writer
-        self._rec_path = path
-        self._rec_trail_buffers = {}
-        self._rec_countin = True
-        self._rec_countin_t0 = time.time()
-        self._rec_countin_beat = 0
-        self.rec_btn.config(
-            text="■ STOP REC", bg="#662222", fg="#ffaaaa",
-            activebackground="#662222")
-
-    def _stop_rec(self):
-        self._recording = False
-        self._rec_countin = False
-        if self._rec_writer is not None:
-            self._rec_writer.release()
-            self._rec_writer = None
-            try:
-                size = os.path.getsize(self._rec_path)
-                mb = size / (1024 * 1024)
-                messagebox.showinfo(
-                    "Recording saved",
-                    f"Saved to:\n{self._rec_path}\n{mb:.1f} MB")
-            except Exception:
-                pass
-        self._rec_path = None
-        self.rec_btn.config(
-            text="⏺ REC", bg="#333333", fg="#cccccc",
-            activebackground="#333333")
-        self.rec_lbl.config(text="")
-        self.playing = False
-        self.play_btn.config(text="▶  PLAY")
-        self._stop_audio()
 
     # ── Params ───────────────────────────────────────────────────────────
 
@@ -1629,47 +1668,6 @@ class WaveformApp(tk.Tk):
         self._tk_img = ImageTk.PhotoImage(Image.fromarray(pf))
         self.canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
 
-        # ── Real-time recording ───────────────────────────────────────────
-        if self._rec_countin:
-            bpm = self.bpm_var.get()
-            beat_dur = 60.0 / bpm
-            countin_elapsed = time.time() - self._rec_countin_t0
-            beat_idx = int(countin_elapsed / beat_dur)
-            self._rec_countin_beat = beat_idx + 1
-            if beat_idx >= 4:
-                # Count-in complete → begin recording
-                self._rec_countin = False
-                self._recording = True
-                self._elapsed = 0.0
-                self._t0 = time.time()
-                self._rec_start_t = 0.0
-                self.playing = True
-                self.play_btn.config(text="⏸  PAUSE")
-                if HAS_PYGAME and self._audio_loaded:
-                    try:
-                        pygame.mixer.music.play(0)
-                    except Exception:
-                        pass
-            else:
-                fraction = (countin_elapsed % beat_dur) / beat_dur
-                beat_num = beat_idx + 1
-                # Write countdown frame at 1080×1920 (BGR for writer)
-                cf = render_countdown_frame(1080, 1920, beat_num, fraction, self.bg_color)
-                self._rec_writer.write(cv2.cvtColor(cf, cv2.COLOR_RGB2BGR))
-                # Override canvas with countdown preview
-                cf_prev = render_countdown_frame(PREVIEW_W, PREVIEW_H, beat_num, fraction, self.bg_color)
-                self._tk_img = ImageTk.PhotoImage(Image.fromarray(cf_prev))
-                self.canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
-                self.rec_lbl.config(text=f"⏺ COUNT {beat_num}/4")
-        elif self._recording:
-            rec_frame = render_frame(1080, 1920, wall, params, self._audio_samples,
-                                     trail_buffers=self._rec_trail_buffers, output_bgr=True)
-            self._rec_writer.write(rec_frame)
-            rec_elapsed = wall - self._rec_start_t
-            rec_m = int(rec_elapsed) // 60
-            rec_s = rec_elapsed - rec_m * 60
-            self.rec_lbl.config(text=f"⏺ REC {rec_m:02d}:{rec_s:05.2f}")
-
         self.after(16, self._tick)
 
     # ── Patch Save / Load ────────────────────────────────────────────────
@@ -1766,7 +1764,7 @@ class WaveformApp(tk.Tk):
         self._update_audio_inject_btn()
         self.duration_var.set(p.get("export_duration", 5))
         self.format_var.set(p.get("export_format", "MP4"))
-        self.res_var.set(p.get("export_res", "4K (2160×3840)"))
+        self.res_var.set(p.get("export_res", "1080×1920"))
         self._automation_data = p.get("automation", {})
         self.line_thickness.set(p.get("line_thickness", 1.0))
         self.line_glow.set(p.get("line_glow", 1.0))
@@ -1938,15 +1936,36 @@ class WaveformApp(tk.Tk):
     def _export_worker(self, path, dur, fmt):
         total = dur * FPS
         res = self.res_var.get()
-        ew, eh = (2160, 3840) if "4K" in res else (1080, 1920)
-        cc = "MJPG" if fmt == "AVI" else "mp4v"
-        fourcc = cv2.VideoWriter_fourcc(*cc)
-        writer = cv2.VideoWriter(path, fourcc, FPS, (ew, eh))
+        if "4K" in res:
+            ew, eh = 2160, 3840
+        elif "720" in res:
+            ew, eh = 720, 1280
+        else:
+            ew, eh = 1080, 1920
+
+        # Try hardware-accelerated encoder first (NVENC via H264), fall back to software
+        writer = None
+        if fmt == "MP4":
+            for cc in ("H264", "h264", "avc1", "mp4v"):
+                fourcc = cv2.VideoWriter_fourcc(*cc)
+                w = cv2.VideoWriter(path, fourcc, FPS, (ew, eh))
+                if w.isOpened():
+                    writer = w
+                    break
+        if writer is None:
+            cc = "MJPG" if fmt == "AVI" else "mp4v"
+            fourcc = cv2.VideoWriter_fourcc(*cc)
+            writer = cv2.VideoWriter(path, fourcc, FPS, (ew, eh))
         if not writer.isOpened():
             self._done("Failed to open video writer.")
             return
+
+        # Choose renderer: GPU if available, else CPU
+        renderer = render_frame_gpu if HAS_CUDA else render_frame
+
         # Build base params ONCE (thread-safe snapshot)
         base_params = self._build_params()
+        has_automation = bool(self._automation_data)
         samples = self._audio_samples
         trail_buffers = {}
         ts = time.time()
@@ -1960,17 +1979,20 @@ class WaveformApp(tk.Tk):
                 self._done("Export cancelled.")
                 return
             t = i * FRAME_DUR
-            # Deep-copy so automation doesn't mutate the base
-            frame_params = copy.deepcopy(base_params)
-            self._apply_automation_to_params(frame_params, t)
+            # Deep-copy modulators only when automation is present
+            if has_automation:
+                frame_params = copy.deepcopy(base_params)
+                self._apply_automation_to_params(frame_params, t)
+            else:
+                frame_params = base_params
             # output_bgr=True skips the BGR→RGB→BGR round-trip
-            frame_bgr = render_frame(ew, eh, t, frame_params, samples,
-                                     trail_buffers, output_bgr=True)
+            frame_bgr = renderer(ew, eh, t, frame_params, samples,
+                                 trail_buffers, output_bgr=True)
             writer.write(frame_bgr)
             pct = (i + 1) / total * 100
             self.progress.set(pct)
             el = time.time() - ts
-            if i > 0 and (i % 10 == 0 or i == total - 1):  # Update UI less frequently
+            if i > 0 and (i % 30 == 0 or i == total - 1):  # batch UI updates every 30 frames
                 eta = el / (i + 1) * (total - i - 1)
                 self.after(0, lambda p=pct, e=eta: self.progress_lbl.config(
                     text=f"{p:.0f}% · ETA {e:.0f}s · {ew}×{eh}"))
