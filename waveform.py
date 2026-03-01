@@ -21,6 +21,7 @@ import os
 import time
 import io
 import json
+import copy
 import pathlib
 import wave as wavmod
 
@@ -166,25 +167,34 @@ def compute_audio_envelope(samples, t, smoothing):
 
 def compute_audio_envelope_array(samples, t, smoothing, n_points):
     """
-    Compute envelope for an array of points along the vertical axis.
-    Creates a waterfall effect where audio ripples down the screen.
+    Compute envelope for an array of points along the vertical axis using a
+    sliding window RMS calculation. Creates a waterfall effect where audio
+    ripples down the screen.
     """
     if samples is None or len(samples) == 0:
         return np.zeros(n_points)
+    n_samples = len(samples)
     spread_sec = smoothing * 2.0
     times = np.linspace(t, t - spread_sec, n_points)
-    times = np.clip(times, 0, len(samples) / AUDIO_SR)
+    times = np.clip(times, 0, n_samples / AUDIO_SR)
     centres = (times * AUDIO_SR).astype(np.int64)
     half_win = max(1, int(smoothing * AUDIO_SR * 0.5))
+
+    starts = np.clip(centres - half_win, 0, n_samples)
+    ends = np.clip(centres + half_win, 0, n_samples)
+    lengths = ends - starts
+
+    # Cumulative sum of squares for O(1) RMS per window
+    sq = samples.astype(np.float64) ** 2
+    cumsum = np.empty(n_samples + 1, dtype=np.float64)
+    cumsum[0] = 0.0
+    np.cumsum(sq, out=cumsum[1:])
+
+    window_sums = cumsum[ends] - cumsum[starts]
+    valid = lengths > 0
     envelope = np.zeros(n_points)
-    for i in range(n_points):
-        c = centres[i]
-        s = max(0, c - half_win)
-        e = min(len(samples), c + half_win)
-        if s >= len(samples) or e <= s:
-            continue
-        chunk = samples[s:e]
-        envelope[i] = min(1.0, np.sqrt(np.mean(chunk ** 2)) * 3.0)
+    envelope[valid] = np.sqrt(window_sums[valid] / lengths[valid]) * 3.0
+    np.clip(envelope, 0.0, 1.0, out=envelope)
     return envelope
 
 
@@ -304,7 +314,7 @@ def compute_waveform(y_norm, t, params, audio_samples=None):
 
 # ─── Rendering ────────────────────────────────────────────────────────────────
 
-def render_frame(width, height, t, params, audio_samples=None, trail_buffers=None):
+def render_frame(width, height, t, params, audio_samples=None, trail_buffers=None, output_bgr=False):
     fg = params["fg_color"]
     bg = params["bg_color"]
     line_thickness_mult = params.get("line_thickness", 1.0)
@@ -331,9 +341,9 @@ def render_frame(width, height, t, params, audio_samples=None, trail_buffers=Non
         glow = np.zeros_like(img)
         cv2.polylines(glow, [pts_fixed], False, fg_bgr, thickness * 3, cv2.LINE_AA, shift=4)
         cv2.addWeighted(img, 1.0, glow, 0.3 * glow_intensity, 0, img)
-        glow2 = np.zeros_like(img)
-        cv2.polylines(glow2, [pts_fixed], False, fg_bgr, thickness * 2, cv2.LINE_AA, shift=4)
-        cv2.addWeighted(img, 1.0, glow2, 0.25 * glow_intensity, 0, img)
+        glow[:] = 0
+        cv2.polylines(glow, [pts_fixed], False, fg_bgr, thickness * 2, cv2.LINE_AA, shift=4)
+        cv2.addWeighted(img, 1.0, glow, 0.25 * glow_intensity, 0, img)
     cv2.polylines(img, [pts_fixed], False, fg_bgr, thickness, cv2.LINE_AA, shift=4)
     if thickness >= 3:
         core_bgr = (min(255, int(fg[2])+120), min(255, int(fg[1])+120), min(255, int(fg[0])+120))
@@ -353,7 +363,8 @@ def render_frame(width, height, t, params, audio_samples=None, trail_buffers=Non
             img = cv2.addWeighted(img, 1.0, prev, trail_amount, 0)
         trail_buffers[key] = img.copy()
 
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if not output_bgr:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     return img
 
 
@@ -1481,6 +1492,8 @@ class WaveformApp(tk.Tk):
         if not writer.isOpened():
             self._done("Failed to open video writer.")
             return
+        # Build base params ONCE (thread-safe snapshot)
+        base_params = self._build_params()
         samples = self._audio_samples
         trail_buffers = {}
         ts = time.time()
@@ -1494,15 +1507,17 @@ class WaveformApp(tk.Tk):
                 self._done("Export cancelled.")
                 return
             t = i * FRAME_DUR
-            params = self._build_params()
-            self._apply_automation_to_params(params, t)
-            frame_rgb = render_frame(ew, eh, t, params, samples, trail_buffers)
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            # Deep-copy so automation doesn't mutate the base
+            frame_params = copy.deepcopy(base_params)
+            self._apply_automation_to_params(frame_params, t)
+            # output_bgr=True skips the BGR→RGB→BGR round-trip
+            frame_bgr = render_frame(ew, eh, t, frame_params, samples,
+                                     trail_buffers, output_bgr=True)
             writer.write(frame_bgr)
             pct = (i + 1) / total * 100
             self.progress.set(pct)
             el = time.time() - ts
-            if i > 0:
+            if i > 0 and (i % 10 == 0 or i == total - 1):  # Update UI less frequently
                 eta = el / (i + 1) * (total - i - 1)
                 self.after(0, lambda p=pct, e=eta: self.progress_lbl.config(
                     text=f"{p:.0f}% · ETA {e:.0f}s · {ew}×{eh}"))
