@@ -553,6 +553,9 @@ class WaveformApp(tk.Tk):
 
         self._trail_buffers = {}
 
+        self._snapshots: list[dict | None] = [None] * 8
+        self._active_snapshot = tk.IntVar(value=-1)
+
         self.param_mod_routing = {
             "amplitude":      [tk.BooleanVar(value=False) for _ in range(5)],
             "overdrive":      [tk.BooleanVar(value=False) for _ in range(5)],
@@ -566,6 +569,7 @@ class WaveformApp(tk.Tk):
             self.param_mod_routing[f"mod{i}_amp"]   = [tk.BooleanVar(value=False) for _ in range(5)]
 
         self._build_ui()
+        self._active_snapshot.trace_add("write", self._on_snapshot_select)
         self._tick()
 
     def _build_ui(self):
@@ -589,6 +593,7 @@ class WaveformApp(tk.Tk):
         s.configure("TLabelframe.Label", foreground="#888888", font=("Consolas", 9, "bold"), background="#111111")
         s.configure("TButton", font=("Consolas", 9))
         s.map("TCheckbutton", background=[("active", "#222222")])
+        s.configure("Snap.TRadiobutton", background="#111111", foreground="#cccccc", font=("Consolas", 8))
 
         root = ttk.Frame(self)
         root.pack(fill="both", expand=True, padx=6, pady=6)
@@ -729,6 +734,31 @@ class WaveformApp(tk.Tk):
         pr.pack(fill="x", padx=4, pady=3)
         ttk.Button(pr, text="💾 Save…", command=self._save_patch).pack(side="left", padx=(0, 8))
         ttk.Button(pr, text="📂 Load…", command=self._load_patch).pack(side="left")
+
+        # ── Snapshots ─────────────────────────────────────────────────────
+        sf = ttk.LabelFrame(col_left, text="SNAPSHOTS")
+        sf.pack(fill="x", pady=(0, 4))
+
+        self._snapshot_btns: list[ttk.Button] = []
+        self._snapshot_radios: list[ttk.Radiobutton] = []
+
+        for row_start in (0, 4):
+            btn_row = ttk.Frame(sf)
+            btn_row.pack(fill="x", padx=4, pady=(2, 0))
+            radio_row = ttk.Frame(sf)
+            radio_row.pack(fill="x", padx=4, pady=(0, 2))
+
+            for i in range(row_start, row_start + 4):
+                idx = i
+                btn = ttk.Button(btn_row, text=str(i + 1), width=4,
+                                 command=lambda ii=idx: self._snapshot_store(ii))
+                btn.pack(side="left", padx=2, expand=True)
+                self._snapshot_btns.append(btn)
+
+                rb = ttk.Radiobutton(radio_row, text="", variable=self._active_snapshot,
+                                     value=i, style="Snap.TRadiobutton")
+                rb.pack(side="left", padx=2, expand=True)
+                self._snapshot_radios.append(rb)
 
         # ═══ RIGHT COLUMN ════════════════════════════════════════════════
 
@@ -1157,6 +1187,7 @@ class WaveformApp(tk.Tk):
             "audio_mod_smoothing": self.audio_mod_smoothing,
             "audio_inject_amp": self.audio_inject_amp,
             "timebase": self.timebase_var,
+            "active_snapshot": self._active_snapshot,
         }
         for i in range(4):
             d[f"mod{i}_depth"] = self.mod_vars[i]["depth"]
@@ -1193,7 +1224,10 @@ class WaveformApp(tk.Tk):
                 continue
             val = self._interpolate_lane(lane, t)
             if val is not None:
-                var.set(val)
+                if key == "active_snapshot":
+                    var.set(int(round(val)))
+                else:
+                    var.set(val)
 
     def _interpolate_lane(self, lane, t):
         """Linear interpolation between keyframes."""
@@ -1249,6 +1283,8 @@ class WaveformApp(tk.Tk):
                 params["audio_mod"]["smoothing"] = val
             elif key == "audio_inject_amp":
                 params["audio_inject"]["amplitude"] = val
+            elif key == "active_snapshot":
+                self._active_snapshot.set(int(round(val)))
             elif key.startswith("mod") and "_" in key:
                 parts = key.split("_", 1)
                 idx = int(parts[0][3:])
@@ -1511,6 +1547,8 @@ class WaveformApp(tk.Tk):
                 key: [v.get() for v in vars_list]
                 for key, vars_list in self.param_mod_routing.items()
             },
+            "snapshots": list(self._snapshots),
+            "active_snapshot": self._active_snapshot.get(),
         }
 
     def _apply_patch(self, p):
@@ -1570,6 +1608,84 @@ class WaveformApp(tk.Tk):
             self.audio_lbl.config(text=f"⚠ {os.path.basename(ap)}")
             self._audio_path = ap
             self._audio_loaded = False
+        saved_snaps = p.get("snapshots", [None] * 8)
+        for i in range(8):
+            if i < len(saved_snaps) and saved_snaps[i] is not None:
+                self._snapshots[i] = saved_snaps[i]
+                self._snapshot_btns[i].config(text=f"●{i+1}")
+            else:
+                self._snapshots[i] = None
+                self._snapshot_btns[i].config(text=str(i+1))
+        self._active_snapshot.set(p.get("active_snapshot", -1))
+
+    # ── Snapshot methods ─────────────────────────────────────────────────
+
+    def _snapshot_store(self, index):
+        """Capture current state into snapshot slot."""
+        patch = self._gather_patch()
+        for key in ("audio_path", "export_duration", "export_format", "export_res",
+                    "automation", "version", "snapshots", "active_snapshot"):
+            patch.pop(key, None)
+        self._snapshots[index] = patch
+        self._snapshot_btns[index].config(text=f"●{index+1}")
+
+    def _on_snapshot_select(self, *_):
+        idx = self._active_snapshot.get()
+        if idx < 0 or idx >= 8:
+            return
+        snap = self._snapshots[idx]
+        if snap is None:
+            return
+        self._apply_snapshot(snap)
+
+    def _apply_snapshot(self, snap):
+        """Apply a snapshot instantly — same as _apply_patch but skipping
+        audio_path, export settings, and automation."""
+        self.bpm_var.set(snap.get("bpm", 120.0))
+        self.timebase_var.set(snap.get("timebase", 1.0))
+        self.tb_preset_var.set(snap.get("timebase_preset", "×1"))
+        self.base_shape.set(snap.get("base_shape", "Sine"))
+        self.base_ratio_var.set(snap.get("base_ratio", "×4"))
+        self.amplitude.set(snap.get("amplitude", 0.4))
+        self.overdrive.set(snap.get("overdrive", 3.0))
+        self.drift_ratio_var.set(snap.get("drift_ratio", "÷4"))
+        self.drift_fine_var.set(snap.get("drift_fine", 1.0))
+        self.fg_color = tuple(snap.get("fg_color", [0, 255, 140]))
+        self.fg_btn.configure(bg=self._hex(self.fg_color))
+        self.bg_color = tuple(snap.get("bg_color", [4, 4, 12]))
+        self.bg_btn.configure(bg=self._hex(self.bg_color))
+        for i, mv in enumerate(self.mod_vars):
+            mods = snap.get("modulators", [])
+            md = mods[i] if i < len(mods) else {}
+            mv["type"].set(md.get("type", "FM"))
+            mv["shape"].set(md.get("shape", "Sine"))
+            mv["ratio"].set(md.get("ratio", "×1"))
+            mv["depth"].set(md.get("depth", 0.0))
+            mv["amp"].set(md.get("amp", 1.0))
+            xm = md.get("xmod", [False, False, False, False])
+            for j in range(4):
+                if j != i:
+                    self.xmod_vars[i][j].set(xm[j] if j < len(xm) else False)
+        am = snap.get("audio_mod", {})
+        self.audio_mod_type.set(am.get("type", "AM"))
+        self.audio_mod_depth.set(am.get("depth", 0.0))
+        self.audio_mod_gain.set(am.get("gain", 1.0))
+        self.audio_mod_smoothing.set(am.get("smoothing", 0.05))
+        self.audio_mod_enabled.set(am.get("enabled", False))
+        self._update_audio_mod_btn()
+        ai = snap.get("audio_inject", {})
+        self.audio_inject_enabled.set(ai.get("enabled", False))
+        self.audio_inject_amp.set(ai.get("amplitude", 0.0))
+        self._update_audio_inject_btn()
+        self.line_thickness.set(snap.get("line_thickness", 1.0))
+        self.line_glow.set(snap.get("line_glow", 1.0))
+        self.line_bloom.set(snap.get("line_bloom", 0.0))
+        self.line_trail.set(snap.get("line_trail", 0.0))
+        routing = snap.get("param_mod_routing", {})
+        for key, vars_list in self.param_mod_routing.items():
+            saved = routing.get(key, [False] * 5)
+            for i, var in enumerate(vars_list):
+                var.set(saved[i] if i < len(saved) else False)
 
     def _save_patch(self):
         path = filedialog.asksaveasfilename(
