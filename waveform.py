@@ -555,6 +555,7 @@ class WaveformApp(tk.Tk):
 
         self._snapshots: list[dict | None] = [None] * 8
         self._active_snapshot = tk.IntVar(value=-1)
+        self._snapshots_locked = tk.BooleanVar(value=False)
 
         self.param_mod_routing = {
             "amplitude":      [tk.BooleanVar(value=False) for _ in range(5)],
@@ -738,6 +739,16 @@ class WaveformApp(tk.Tk):
         # ── Snapshots ─────────────────────────────────────────────────────
         sf = ttk.LabelFrame(col_left, text="SNAPSHOTS")
         sf.pack(fill="x", pady=(0, 4))
+
+        # Lock row
+        lock_row = ttk.Frame(sf)
+        lock_row.pack(fill="x", padx=4, pady=(2, 0))
+        self._snap_lock_btn = tk.Button(
+            lock_row, text="🔓 UNLOCKED",
+            bg="#333333", fg="#cccccc", activebackground="#333333",
+            relief="raised", bd=1, padx=4, pady=1,
+            command=self._toggle_snap_lock, font=("Consolas", 8))
+        self._snap_lock_btn.pack(side="left")
 
         self._snapshot_btns: list[ttk.Button] = []
         self._snapshot_radios: list[ttk.Radiobutton] = []
@@ -1222,11 +1233,14 @@ class WaveformApp(tk.Tk):
             lane = self._automation_data.get(key, [])
             if not lane:
                 continue
-            val = self._interpolate_lane(lane, t)
-            if val is not None:
-                if key == "active_snapshot":
+            if key == "active_snapshot":
+                # Step/hold: use the most recent keyframe value, no interpolation
+                val = self._step_lane(lane, t)
+                if val is not None:
                     var.set(int(round(val)))
-                else:
+            else:
+                val = self._interpolate_lane(lane, t)
+                if val is not None:
                     var.set(val)
 
     def _interpolate_lane(self, lane, t):
@@ -1251,10 +1265,33 @@ class WaveformApp(tk.Tk):
         frac = (t - t0) / (t1 - t0)
         return v0 + (v1 - v0) * frac
 
+    def _step_lane(self, lane, t):
+        """Step/hold lookup — return the value of the most recent keyframe at or before time t.
+        Unlike _interpolate_lane, this does NOT interpolate between keyframes.
+        Use for discrete parameters like snapshot index."""
+        if not lane:
+            return None
+        if t < lane[0]["t"]:
+            return lane[0]["v"]
+        # Binary search for the last keyframe at or before t
+        lo, hi = 0, len(lane) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if lane[mid]["t"] <= t:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lane[lo]["v"]
+
     def _apply_automation_to_params(self, params, t):
         """Override params dict values with automation data at time t."""
         for key, lane in self._automation_data.items():
             if not lane:
+                continue
+            if key == "active_snapshot":
+                val = self._step_lane(lane, t)
+                if val is not None:
+                    self._active_snapshot.set(int(round(val)))
                 continue
             val = self._interpolate_lane(lane, t)
             if val is None:
@@ -1283,8 +1320,6 @@ class WaveformApp(tk.Tk):
                 params["audio_mod"]["smoothing"] = val
             elif key == "audio_inject_amp":
                 params["audio_inject"]["amplitude"] = val
-            elif key == "active_snapshot":
-                self._active_snapshot.set(int(round(val)))
             elif key.startswith("mod") and "_" in key:
                 parts = key.split("_", 1)
                 idx = int(parts[0][3:])
@@ -1549,6 +1584,7 @@ class WaveformApp(tk.Tk):
             },
             "snapshots": list(self._snapshots),
             "active_snapshot": self._active_snapshot.get(),
+            "snapshots_locked": self._snapshots_locked.get(),
         }
 
     def _apply_patch(self, p):
@@ -1617,11 +1653,35 @@ class WaveformApp(tk.Tk):
                 self._snapshots[i] = None
                 self._snapshot_btns[i].config(text=str(i+1))
         self._active_snapshot.set(p.get("active_snapshot", -1))
+        self._snapshots_locked.set(p.get("snapshots_locked", False))
+        # Update lock button appearance
+        if self._snapshots_locked.get():
+            self._snap_lock_btn.configure(
+                text="🔒 LOCKED", bg="#662222", fg="#ffaaaa",
+                activebackground="#662222")
+        else:
+            self._snap_lock_btn.configure(
+                text="🔓 UNLOCKED", bg="#333333", fg="#cccccc",
+                activebackground="#333333")
 
     # ── Snapshot methods ─────────────────────────────────────────────────
 
+    def _toggle_snap_lock(self):
+        locked = not self._snapshots_locked.get()
+        self._snapshots_locked.set(locked)
+        if locked:
+            self._snap_lock_btn.configure(
+                text="🔒 LOCKED", bg="#662222", fg="#ffaaaa",
+                activebackground="#662222")
+        else:
+            self._snap_lock_btn.configure(
+                text="🔓 UNLOCKED", bg="#333333", fg="#cccccc",
+                activebackground="#333333")
+
     def _snapshot_store(self, index):
         """Capture current state into snapshot slot."""
+        if self._snapshots_locked.get():
+            return  # Do nothing when locked
         patch = self._gather_patch()
         for key in ("audio_path", "export_duration", "export_format", "export_res",
                     "automation", "version", "snapshots", "active_snapshot"):
