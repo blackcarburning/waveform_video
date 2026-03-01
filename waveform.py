@@ -625,11 +625,16 @@ class WaveformApp(tk.Tk):
         self.audio_mod_type = tk.StringVar(value="AM")
         ttk.Combobox(am_r0, textvariable=self.audio_mod_type, values=AUDIO_MOD_TYPES,
                      state="readonly", width=4).pack(side="left", padx=(0, 8))
-        ttk.Checkbutton(am_r0, text="Connect", variable=self.audio_mod_enabled).pack(side="left", padx=(0, 6))
+        self.audio_mod_btn = tk.Button(
+            am_r0, text="⊘ CONNECT",
+            bg="#333333", fg="#cccccc", activebackground="#333333",
+            relief="raised", bd=1, padx=4, pady=1,
+            command=self._toggle_audio_mod)
+        self.audio_mod_btn.pack(side="left", padx=(0, 6))
         self.audio_mod_info = ttk.Label(am_r0, text="", style="AudioMod.TLabel")
         self.audio_mod_info.pack(side="left", padx=4)
 
-        self._audio_mod_slider(amf, "Depth", 0.0, 5.0, 0.0, "audio_mod_depth")
+        self._audio_mod_slider(amf, "Depth", 0.0, 5.0, 1.0, "audio_mod_depth")
         self._audio_mod_slider(amf, "Gain", 0.1, 5.0, 1.0, "audio_mod_gain")
         self._audio_mod_slider(amf, "Smooth", 0.005, 0.5, 0.05, "audio_mod_smoothing")
 
@@ -733,6 +738,20 @@ class WaveformApp(tk.Tk):
         lbl = ttk.Label(r, text=f"{default:.3f}", width=6)
         lbl.pack(side="left")
         setattr(self, f"_{attr}_lbl", lbl)
+
+    def _toggle_audio_mod(self):
+        self.audio_mod_enabled.set(not self.audio_mod_enabled.get())
+        self._update_audio_mod_btn()
+
+    def _update_audio_mod_btn(self):
+        if self.audio_mod_enabled.get():
+            self.audio_mod_btn.configure(
+                text="● CONNECTED", bg="#226622", fg="#aaffaa",
+                activebackground="#226622")
+        else:
+            self.audio_mod_btn.configure(
+                text="⊘ CONNECT", bg="#333333", fg="#cccccc",
+                activebackground="#333333")
 
     # ── Color helpers ────────────────────────────────────────────────────
 
@@ -1148,6 +1167,7 @@ class WaveformApp(tk.Tk):
         self.audio_mod_gain.set(am.get("gain", 1.0))
         self.audio_mod_smoothing.set(am.get("smoothing", 0.05))
         self.audio_mod_enabled.set(am.get("enabled", False))
+        self._update_audio_mod_btn()
         self.duration_var.set(p.get("export_duration", 5))
         self.format_var.set(p.get("export_format", "MP4"))
         self.res_var.set(p.get("export_res", "4K (2160×3840)"))
