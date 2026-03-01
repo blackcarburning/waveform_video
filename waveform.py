@@ -353,8 +353,15 @@ def compute_param_modulation(t, params, audio_samples=None):
     offsets = {}
     for param_key, flags in routing.items():
         total = 0.0
+        # Determine if this is a mod self-modulation case
+        self_mod_idx = -1
+        if param_key.startswith("mod") and "_" in param_key:
+            try:
+                self_mod_idx = int(param_key[3:param_key.index("_")])
+            except ValueError:
+                pass
         for i in range(min(4, len(flags))):
-            if flags[i] and i < len(mod_scalars):
+            if flags[i] and i < len(mod_scalars) and i != self_mod_idx:
                 m = params["modulators"][i]
                 total += m["depth"] * mod_scalars[i]
         if len(flags) > 4 and flags[4]:
@@ -394,6 +401,17 @@ def render_frame(width, height, t, params, audio_samples=None, trail_buffers=Non
             render_params["overdrive"] = max(0.1, params["overdrive"] + param_mods["overdrive"])  # 0.1: avoid div-by-zero
         if "amplitude" in param_mods:
             render_params["base_amplitude"] = max(0.0, min(1.0, params["base_amplitude"] + param_mods["amplitude"]))
+    if any(f"mod{i}_depth" in param_mods or f"mod{i}_amp" in param_mods for i in range(4)):
+        if render_params is params:
+            render_params = dict(params)
+        render_params["modulators"] = copy.deepcopy(params["modulators"])
+        for i in range(min(4, len(render_params["modulators"]))):
+            if f"mod{i}_depth" in param_mods:
+                render_params["modulators"][i]["depth"] = max(0.0,
+                    params["modulators"][i]["depth"] + param_mods[f"mod{i}_depth"])
+            if f"mod{i}_amp" in param_mods:
+                render_params["modulators"][i]["amplitude"] = max(0.0,
+                    params["modulators"][i]["amplitude"] + param_mods[f"mod{i}_amp"])
     y_norm = np.linspace(0, 1, height)
     wave = compute_waveform(y_norm, t, render_params, audio_samples)
     margin = width * 0.04
@@ -543,6 +561,9 @@ class WaveformApp(tk.Tk):
             "line_bloom":     [tk.BooleanVar(value=False) for _ in range(5)],
             "line_trail":     [tk.BooleanVar(value=False) for _ in range(5)],
         }
+        for i in range(4):
+            self.param_mod_routing[f"mod{i}_depth"] = [tk.BooleanVar(value=False) for _ in range(5)]
+            self.param_mod_routing[f"mod{i}_amp"]   = [tk.BooleanVar(value=False) for _ in range(5)]
 
         self._build_ui()
         self._tick()
@@ -734,8 +755,10 @@ class WaveformApp(tk.Tk):
             mv["hz_lbl"] = ttk.Label(r0, text="", style="Hz.TLabel")
             mv["hz_lbl"].pack(side="left", padx=4)
 
-            self._mod_slider(mf, "Dpt", 0.0, 5.0, 0.0, mv, "depth")
-            self._mod_slider(mf, "Amp", 0.0, 3.0, 1.0, mv, "amp")
+            self._mod_slider(mf, "Dpt", 0.0, 5.0, 0.0, mv, "depth",
+                             mod_route_key=f"mod{i}_depth", disable_index=i)
+            self._mod_slider(mf, "Amp", 0.0, 3.0, 1.0, mv, "amp",
+                             mod_route_key=f"mod{i}_amp", disable_index=i)
 
             xrow = ttk.Frame(mf)
             xrow.pack(fill="x", padx=2, pady=(0, 2))
@@ -883,17 +906,26 @@ class WaveformApp(tk.Tk):
                 ttk.Checkbutton(r, text=name, variable=route_vars[idx],
                                 style="Route.TCheckbutton").pack(side="left", padx=1)
 
-    def _mod_slider(self, parent, label, lo, hi, default, store, key):
+    def _mod_slider(self, parent, label, lo, hi, default, store, key, mod_route_key=None, disable_index=None):
         r = ttk.Frame(parent)
         r.pack(fill="x", padx=2, pady=1)
         ttk.Label(r, text=label, width=4).pack(side="left")
         var = tk.DoubleVar(value=default)
         store[key] = var
         ttk.Scale(r, from_=lo, to=hi, variable=var,
-                  orient="horizontal", length=180).pack(side="left", padx=(0, 4))
+                  orient="horizontal", length=140).pack(side="left", padx=(0, 4))
         lbl = ttk.Label(r, text=f"{default:.2f}", width=5)
         lbl.pack(side="left")
         store[f"{key}_lbl"] = lbl
+
+        if mod_route_key and mod_route_key in self.param_mod_routing:
+            ttk.Label(r, text="│", font=("Consolas", 7), foreground="#444444",
+                      background="#111111").pack(side="left", padx=(2, 2))
+            route_vars = self.param_mod_routing[mod_route_key]
+            for idx, name in enumerate(["M1", "M2", "M3", "M4", "Au"]):
+                state = "disabled" if idx == disable_index else "!disabled"
+                ttk.Checkbutton(r, text=name, variable=route_vars[idx],
+                                style="Route.TCheckbutton", state=state).pack(side="left", padx=1)
 
     def _audio_mod_slider(self, parent, label, lo, hi, default, attr):
         r = ttk.Frame(parent)
