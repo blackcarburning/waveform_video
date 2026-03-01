@@ -553,6 +553,15 @@ class WaveformApp(tk.Tk):
 
         self._trail_buffers = {}
 
+        self._rec_writer = None
+        self._rec_path = None
+        self._recording = False
+        self._rec_countin = False
+        self._rec_countin_beat = 0
+        self._rec_countin_t0 = 0.0
+        self._rec_start_t = 0.0
+        self._rec_trail_buffers = {}
+
         self._snapshots: list[dict | None] = [None] * 8
         self._active_snapshot = tk.IntVar(value=-1)
         self._snapshots_locked = tk.BooleanVar(value=False)
@@ -617,9 +626,23 @@ class WaveformApp(tk.Tk):
         br.pack(fill="x", padx=4, pady=3)
         self.play_btn = ttk.Button(br, text="▶  PLAY", command=self._play, width=10)
         self.play_btn.pack(side="left", padx=(0, 4))
-        ttk.Button(br, text="⏹  STOP", command=self._stop, width=10).pack(side="left", padx=(0, 8))
+        ttk.Button(br, text="⏹  STOP", command=self._stop, width=10).pack(side="left", padx=(0, 4))
+        self.rec_btn = tk.Button(
+            br, text="⏺ REC",
+            bg="#333333", fg="#cccccc", activebackground="#333333",
+            relief="raised", bd=1, padx=4, pady=1,
+            command=self._toggle_rec, width=9)
+        self.rec_btn.pack(side="left", padx=(0, 8))
         self.time_lbl = ttk.Label(br, text="00:00.000", style="Time.TLabel")
         self.time_lbl.pack(side="left", padx=4)
+
+        rr = ttk.Frame(tp)
+        rr.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Label(rr, text="Records preview at 1080×1920 · video only",
+                  font=("Consolas", 7), foreground="#666666",
+                  background="#111111").pack(side="left")
+        self.rec_lbl = ttk.Label(rr, text="", style="Rec.TLabel")
+        self.rec_lbl.pack(side="left", padx=(8, 0))
 
         tbr = ttk.Frame(tp)
         tbr.pack(fill="x", padx=4, pady=(0, 3))
@@ -1133,6 +1156,62 @@ class WaveformApp(tk.Tk):
             self._auto_stop_write()
         elif self._auto_mode == "overdub":
             self._auto_stop_overdub()
+        if self._recording or self._rec_countin:
+            self._stop_rec()
+
+    # ── Real-time Recording ──────────────────────────────────────────────
+
+    def _toggle_rec(self):
+        if self._recording or self._rec_countin:
+            self._stop_rec()
+        else:
+            self._start_rec()
+
+    def _start_rec(self):
+        fmt = self.format_var.get()
+        ext = ".mp4" if fmt == "MP4" else ".avi"
+        ftypes = [(fmt, f"*{ext}")]
+        path = filedialog.asksaveasfilename(defaultextension=ext, filetypes=ftypes)
+        if not path:
+            return
+        cc = "MJPG" if fmt == "AVI" else "mp4v"
+        fourcc = cv2.VideoWriter_fourcc(*cc)
+        writer = cv2.VideoWriter(path, fourcc, FPS, (1080, 1920))
+        if not writer.isOpened():
+            messagebox.showerror("Error", "Failed to open video writer.")
+            return
+        self._rec_writer = writer
+        self._rec_path = path
+        self._rec_trail_buffers = {}
+        self._rec_countin = True
+        self._rec_countin_t0 = time.time()
+        self._rec_countin_beat = 0
+        self.rec_btn.config(
+            text="■ STOP REC", bg="#662222", fg="#ffaaaa",
+            activebackground="#662222")
+
+    def _stop_rec(self):
+        self._recording = False
+        self._rec_countin = False
+        if self._rec_writer is not None:
+            self._rec_writer.release()
+            self._rec_writer = None
+            try:
+                size = os.path.getsize(self._rec_path)
+                mb = size / (1024 * 1024)
+                messagebox.showinfo(
+                    "Recording saved",
+                    f"Saved to:\n{self._rec_path}\n{mb:.1f} MB")
+            except Exception:
+                pass
+        self._rec_path = None
+        self.rec_btn.config(
+            text="⏺ REC", bg="#333333", fg="#cccccc",
+            activebackground="#333333")
+        self.rec_lbl.config(text="")
+        self.playing = False
+        self.play_btn.config(text="▶  PLAY")
+        self._stop_audio()
 
     # ── Params ───────────────────────────────────────────────────────────
 
@@ -1549,6 +1628,48 @@ class WaveformApp(tk.Tk):
                           trail_buffers=self._trail_buffers)
         self._tk_img = ImageTk.PhotoImage(Image.fromarray(pf))
         self.canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
+
+        # ── Real-time recording ───────────────────────────────────────────
+        if self._rec_countin:
+            bpm = self.bpm_var.get()
+            beat_dur = 60.0 / bpm
+            countin_elapsed = time.time() - self._rec_countin_t0
+            beat_idx = int(countin_elapsed / beat_dur)
+            self._rec_countin_beat = beat_idx + 1
+            if beat_idx >= 4:
+                # Count-in complete → begin recording
+                self._rec_countin = False
+                self._recording = True
+                self._elapsed = 0.0
+                self._t0 = time.time()
+                self._rec_start_t = 0.0
+                self.playing = True
+                self.play_btn.config(text="⏸  PAUSE")
+                if HAS_PYGAME and self._audio_loaded:
+                    try:
+                        pygame.mixer.music.play(0)
+                    except Exception:
+                        pass
+            else:
+                fraction = (countin_elapsed % beat_dur) / beat_dur
+                beat_num = beat_idx + 1
+                # Write countdown frame at 1080×1920 (BGR for writer)
+                cf = render_countdown_frame(1080, 1920, beat_num, fraction, self.bg_color)
+                self._rec_writer.write(cv2.cvtColor(cf, cv2.COLOR_RGB2BGR))
+                # Override canvas with countdown preview
+                cf_prev = render_countdown_frame(PREVIEW_W, PREVIEW_H, beat_num, fraction, self.bg_color)
+                self._tk_img = ImageTk.PhotoImage(Image.fromarray(cf_prev))
+                self.canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
+                self.rec_lbl.config(text=f"⏺ COUNT {beat_num}/4")
+        elif self._recording:
+            rec_frame = render_frame(1080, 1920, wall, params, self._audio_samples,
+                                     trail_buffers=self._rec_trail_buffers, output_bgr=True)
+            self._rec_writer.write(rec_frame)
+            rec_elapsed = wall - self._rec_start_t
+            rec_m = int(rec_elapsed) // 60
+            rec_s = rec_elapsed - rec_m * 60
+            self.rec_lbl.config(text=f"⏺ REC {rec_m:02d}:{rec_s:05.2f}")
+
         self.after(16, self._tick)
 
     # ── Patch Save / Load ────────────────────────────────────────────────
