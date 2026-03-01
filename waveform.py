@@ -725,7 +725,7 @@ class WaveformApp(tk.Tk):
         er0.pack(fill="x", padx=4, pady=2)
         ttk.Label(er0, text="Sec").pack(side="left", padx=(0, 4))
         self.duration_var = tk.IntVar(value=5)
-        ttk.Spinbox(er0, from_=1, to=30, textvariable=self.duration_var,
+        ttk.Spinbox(er0, from_=1, to=500, textvariable=self.duration_var,
                     width=4).pack(side="left", padx=(0, 8))
         ttk.Label(er0, text="Fmt").pack(side="left", padx=(0, 4))
         self.format_var = tk.StringVar(value="MP4")
@@ -1326,7 +1326,7 @@ class WaveformApp(tk.Tk):
 
     def _export(self):
         dur = self.duration_var.get()
-        if not 1 <= dur <= 30:
+        if not 1 <= dur <= 500:
             messagebox.showerror("Error", "Duration must be 1–30 s")
             return
         fmt = self.format_var.get()
