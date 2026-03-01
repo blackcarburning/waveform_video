@@ -716,6 +716,11 @@ class WaveformApp(tk.Tk):
         self._active_snapshot = tk.IntVar(value=-1)
         self._snapshots_locked = tk.BooleanVar(value=False)
 
+        self.bar_var = tk.IntVar(value=1)
+        self.bar_fine_var = tk.DoubleVar(value=0.0)
+        self._bar_tracking = False
+        self._audio_dur = 0.0
+
         self.param_mod_routing = {
             "amplitude":      [tk.BooleanVar(value=False) for _ in range(5)],
             "overdrive":      [tk.BooleanVar(value=False) for _ in range(5)],
@@ -752,6 +757,7 @@ class WaveformApp(tk.Tk):
         s.configure("Meter.TLabel", foreground="#44ff88", font=("Consolas", 9), background="#111111")
         s.configure("TLabelframe.Label", foreground="#888888", font=("Consolas", 9, "bold"), background="#111111")
         s.configure("TButton", font=("Consolas", 9))
+        s.configure("Bar.TLabel", foreground="#88ffcc", font=("Consolas", 9, "bold"), background="#111111")
         s.map("TCheckbutton", background=[("active", "#222222")])
         s.configure("Snap.TRadiobutton", background="#111111", foreground="#cccccc", font=("Consolas", 8))
 
@@ -779,6 +785,26 @@ class WaveformApp(tk.Tk):
         ttk.Button(br, text="⏹  STOP", command=self._stop, width=10).pack(side="left", padx=(0, 4))
         self.time_lbl = ttk.Label(br, text="00:00.000", style="Time.TLabel")
         self.time_lbl.pack(side="left", padx=4)
+
+        bar_row = ttk.Frame(tp)
+        bar_row.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Label(bar_row, text="Bar").pack(side="left", padx=(0, 4))
+        self.bar_slider = ttk.Scale(bar_row, from_=1, to=999, variable=self.bar_var,
+                                    orient="horizontal", length=120,
+                                    command=self._on_bar_seek)
+        self.bar_slider.pack(side="left", padx=(0, 4))
+        self.bar_lbl = ttk.Label(bar_row, text="Bar 1", style="Bar.TLabel", width=7)
+        self.bar_lbl.pack(side="left", padx=(0, 6))
+        self.beat_lbl = ttk.Label(bar_row, text="Beat 1.0", style="Hz.TLabel", width=9)
+        self.beat_lbl.pack(side="left", padx=(0, 6))
+        ttk.Label(bar_row, text="Fine").pack(side="left", padx=(0, 2))
+        self.bar_fine_slider = ttk.Scale(bar_row, from_=0.0, to=1.0,
+                                         variable=self.bar_fine_var,
+                                         orient="horizontal", length=60,
+                                         command=self._on_bar_seek)
+        self.bar_fine_slider.pack(side="left", padx=(0, 2))
+        self.bar_fine_lbl = ttk.Label(bar_row, text="0.00", width=5)
+        self.bar_fine_lbl.pack(side="left")
 
         tbr = ttk.Frame(tp)
         tbr.pack(fill="x", padx=4, pady=(0, 3))
@@ -1205,6 +1231,23 @@ class WaveformApp(tk.Tk):
     def _on_tb_preset(self, _e=None):
         self.timebase_var.set(TIMEBASE_VALUES.get(self.tb_preset_var.get(), 1.0))
 
+    def _on_bar_seek(self, _val=None):
+        if self._bar_tracking:
+            return
+        bpm = self.bpm_var.get()
+        bar_duration = 4 * 60.0 / bpm  # 4 beats per bar (4/4 time)
+        bar_num = self.bar_var.get()
+        fine = self.bar_fine_var.get()
+        target_time = (bar_num - 1 + fine) * bar_duration
+        self._elapsed = target_time
+        if self.playing:
+            self._t0 = time.time()
+            if HAS_PYGAME and self._audio_loaded:
+                try:
+                    pygame.mixer.music.play(0, start=target_time)
+                except TypeError:
+                    pygame.mixer.music.play(0)
+
     # ── Audio ────────────────────────────────────────────────────────────
 
     def _load_audio(self, path=None):
@@ -1232,7 +1275,13 @@ class WaveformApp(tk.Tk):
             if samples is not None:
                 self._audio_samples = samples
                 dur = len(samples) / AUDIO_SR
+                self._audio_dur = dur
                 self.audio_lbl.config(text=f"✓ {os.path.basename(path)} ({dur:.1f}s)")
+                # Update bar slider range based on audio duration
+                bpm = self.bpm_var.get()
+                bar_duration = 4 * 60.0 / bpm
+                max_bars = max(1, int(dur / bar_duration) + 1)
+                self.bar_slider.config(to=max_bars)
             else:
                 self._audio_samples = None
                 self.audio_lbl.config(
@@ -1253,6 +1302,8 @@ class WaveformApp(tk.Tk):
         self._audio_loaded = False
         self._audio_path = None
         self._audio_samples = None
+        self._audio_dur = 0.0
+        self.bar_slider.config(to=999)
         self.audio_lbl.config(text="No audio loaded")
         self.audio_meter_lbl.config(text="Level: ────────────────────")
 
@@ -1291,6 +1342,8 @@ class WaveformApp(tk.Tk):
         self._elapsed = 0.0
         self._stop_audio()
         self.play_btn.config(text="▶  PLAY")
+        self.bar_var.set(1)
+        self.bar_fine_var.set(0.0)
         if self._auto_mode == "write":
             self._auto_stop_write()
         elif self._auto_mode == "overdub":
@@ -1666,6 +1719,19 @@ class WaveformApp(tk.Tk):
         sec = wall - m * 60
         self.time_lbl.config(text=f"{m:02d}:{sec:06.3f}")
 
+        # Bar / beat tracking
+        bpm = self.bpm_var.get()
+        bar_duration = 4 * 60.0 / bpm  # 4 beats per bar (4/4 time)
+        current_bar = int(wall / bar_duration) + 1
+        beat_in_bar = (wall % bar_duration) / (60.0 / bpm) + 1
+        self.bar_lbl.config(text=f"Bar {current_bar}")
+        self.beat_lbl.config(text=f"Beat {beat_in_bar:.1f}")
+        self.bar_fine_lbl.config(text=f"{self.bar_fine_var.get():.2f}")
+        if self.playing:
+            self._bar_tracking = True
+            self.bar_var.set(current_bar)
+            self._bar_tracking = False
+
         # Audio level meter
         if not self.audio_mod_enabled.get():
             self.audio_meter_lbl.config(text="Level: ────────────────────")
@@ -1767,6 +1833,8 @@ class WaveformApp(tk.Tk):
             "snapshots": list(self._snapshots),
             "active_snapshot": self._active_snapshot.get(),
             "snapshots_locked": self._snapshots_locked.get(),
+            "start_bar": self.bar_var.get(),
+            "start_bar_fine": self.bar_fine_var.get(),
         }
 
     def _apply_patch(self, p):
@@ -1845,6 +1913,14 @@ class WaveformApp(tk.Tk):
             self._snap_lock_btn.configure(
                 text="🔓 UNLOCKED", bg="#333333", fg="#cccccc",
                 activebackground="#333333")
+        bar = p.get("start_bar", 1)
+        fine = p.get("start_bar_fine", 0.0)
+        validated_bar = max(1, bar)
+        self.bar_var.set(validated_bar)
+        self.bar_fine_var.set(fine)
+        bpm = self.bpm_var.get()
+        bar_duration = 4 * 60.0 / bpm  # 4 beats per bar (4/4 time)
+        self._elapsed = (validated_bar - 1 + fine) * bar_duration
 
     # ── Snapshot methods ─────────────────────────────────────────────────
 
@@ -1972,12 +2048,13 @@ class WaveformApp(tk.Tk):
         self.export_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
         self._export_cancel = False
-        threading.Thread(target=self._export_worker, args=(path, dur, fmt), daemon=True).start()
+        start_t = self._elapsed
+        threading.Thread(target=self._export_worker, args=(path, dur, fmt, start_t), daemon=True).start()
 
     def _cancel_export(self):
         self._export_cancel = True
 
-    def _export_worker(self, path, dur, fmt):
+    def _export_worker(self, path, dur, fmt, start_t=0.0):
         total = dur * FPS
         res = self.res_var.get()
         if "4K" in res:
@@ -2043,7 +2120,7 @@ class WaveformApp(tk.Tk):
                 batch_end = min(i + batch_size, total)
                 batch_args = []
                 for j in range(i, batch_end):
-                    t_frame = j * FRAME_DUR
+                    t_frame = start_t + j * FRAME_DUR
                     if has_automation:
                         frame_params = _shallow_copy_params(base_params)
                         self._apply_automation_to_params(frame_params, t_frame)
