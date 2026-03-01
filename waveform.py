@@ -90,7 +90,7 @@ TIMEBASE_TABLE = [
 TIMEBASE_LABELS = [t[0] for t in TIMEBASE_TABLE]
 TIMEBASE_VALUES = {t[0]: t[1] for t in TIMEBASE_TABLE}
 
-SHAPES = ["Sine", "Square", "Triangle", "Sawtooth", "Noise"]
+SHAPES = ["Sine", "Square", "Triangle", "Sawtooth", "Noise", "Random S&H"]
 MOD_TYPES = ["AM", "FM"]
 AUDIO_MOD_TYPES = ["AM", "FM"]
 REF_H = 480
@@ -230,6 +230,13 @@ def generate_wave(shape, phase):
         sp = np.linspace(0, phase.max() - phase.min(), pts)
         sv = np.random.RandomState(42).uniform(-1, 1, pts)
         return np.interp(phase - phase.min(), sp, sv)
+    elif shape == "Random S&H":
+        # Sample & Hold: hard-stepped random value per cycle
+        step = np.floor(phase / (2 * np.pi)).astype(np.int64)
+        # Golden-ratio hash for fast pseudo-random mapping
+        golden = np.uint64(0x9E3779B97F4A7C15)
+        hashed = (step.astype(np.uint64) * golden).astype(np.int64)
+        return (hashed % 65537) / 32768.0 - 1.0
     return np.sin(phase)
 
 
@@ -1338,12 +1345,10 @@ class WaveformApp(tk.Tk):
                     pygame.mixer.music.play(0)
 
     def _stop(self):
+        self._elapsed = self._wall_time()
         self.playing = False
-        self._elapsed = 0.0
         self._stop_audio()
         self.play_btn.config(text="▶  PLAY")
-        self.bar_var.set(1)
-        self.bar_fine_var.set(0.0)
         if self._auto_mode == "write":
             self._auto_stop_write()
         elif self._auto_mode == "overdub":
@@ -2048,7 +2053,8 @@ class WaveformApp(tk.Tk):
         self.export_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
         self._export_cancel = False
-        start_t = self._elapsed
+        bar_duration = 4 * 60.0 / self.bpm_var.get()
+        start_t = (self.bar_var.get() - 1 + self.bar_fine_var.get()) * bar_duration
         threading.Thread(target=self._export_worker, args=(path, dur, fmt, start_t), daemon=True).start()
 
     def _cancel_export(self):
