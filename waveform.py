@@ -2098,7 +2098,6 @@ class WaveformApp(tk.Tk):
         has_automation = bool(self._automation_data)
         samples = self._audio_samples
         trail_buffers = {}
-        trail_amount = base_params.get("line_trail", 0.0)
 
         # Pre-compute reusable arrays sent once to each worker via the initializer
         precomputed = {
@@ -2144,11 +2143,12 @@ class WaveformApp(tk.Tk):
                 frames = pool.map(_render_frame_worker, batch_args)
 
                 # Sequential trail compositing and write
-                for frame_bgr in frames:
-                    if trail_amount > 0:
+                for frame_bgr, (_, _, _, f_params) in zip(frames, batch_args):
+                    frame_trail = f_params.get("line_trail", 0.0)
+                    if frame_trail > 0:
                         key = (ew, eh)
                         if key in trail_buffers:
-                            frame_bgr = cv2.addWeighted(frame_bgr, 1.0, trail_buffers[key], trail_amount, 0)
+                            frame_bgr = cv2.addWeighted(frame_bgr, 1.0, trail_buffers[key], frame_trail, 0)
                         trail_buffers[key] = frame_bgr.copy()
                     writer.write(frame_bgr)
 
