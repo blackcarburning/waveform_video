@@ -472,7 +472,7 @@ def render_frame(width, height, t, params, audio_samples=None, trail_buffers=Non
 
     # Bloom (Gaussian blur glow)
     if bloom_amount > 0:
-        ksize = max(3, int(scale * bloom_amount * 30) | 1)  # ensure odd
+        ksize = min(51, max(3, int(scale * bloom_amount * 30) | 1))  # ensure odd, cap for perf
         blurred = cv2.GaussianBlur(img, (ksize, ksize), 0)
         cv2.addWeighted(img, 1.0, blurred, bloom_amount * 0.4, 0, img)
 
@@ -576,7 +576,7 @@ def render_frame_gpu(width, height, t, params, audio_samples=None, trail_buffers
 
     # GPU: bloom
     if bloom_amount > 0:
-        ksize = max(3, int(scale * bloom_amount * 30) | 1)
+        ksize = min(51, max(3, int(scale * bloom_amount * 30) | 1))  # ensure odd, cap for perf
         gpu_img = cv2.cuda_GpuMat()
         gpu_img.upload(img)
         gauss_filter = cv2.cuda.createGaussianFilter(
@@ -1355,9 +1355,8 @@ class WaveformApp(tk.Tk):
                     pygame.mixer.music.play(0)
 
     def _stop(self):
-        if self.playing:
-            self._elapsed += time.time() - self._t0
         self.playing = False
+        self._elapsed = 0.0
         self._stop_audio()
         self.play_btn.config(text="▶  PLAY")
         if self._auto_mode == "write":
