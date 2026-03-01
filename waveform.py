@@ -286,6 +286,19 @@ def compute_waveform(y_norm, t, params, audio_samples=None):
     wave = np.clip(wave, -ceiling, ceiling)
     if ceiling > 0:
         wave /= ceiling
+
+    # Audio direct inject
+    audio_inject = params.get("audio_inject")
+    if audio_inject and audio_inject["amplitude"] > 0 and audio_samples is not None:
+        inject_amp = audio_inject["amplitude"]
+        n_points = len(y_norm)
+        times = np.linspace(t, t - FRAME_DUR, n_points)
+        times = np.clip(times, 0, len(audio_samples) / AUDIO_SR)
+        indices = (times * AUDIO_SR).astype(np.int64)
+        indices = np.clip(indices, 0, len(audio_samples) - 1)
+        raw_audio = audio_samples[indices] * inject_amp
+        wave += raw_audio
+
     return wave
 
 
@@ -408,6 +421,7 @@ class WaveformApp(tk.Tk):
         self._audio_samples = None
         self.xmod_vars: list[list[tk.BooleanVar]] = []
         self.audio_mod_enabled = tk.BooleanVar(value=False)
+        self.audio_inject_enabled = tk.BooleanVar(value=False)
 
         self._recording = False
         self._rec_stop = False
@@ -642,6 +656,20 @@ class WaveformApp(tk.Tk):
                   font=("Consolas", 7), foreground="#666666",
                   background="#111111").pack(fill="x", padx=4, pady=(0, 2))
 
+        # Audio inject row
+        ai_r0 = ttk.Frame(amf)
+        ai_r0.pack(fill="x", padx=4, pady=2)
+        self.audio_inject_btn = tk.Button(
+            ai_r0, text="⊘ INJECT",
+            bg="#333333", fg="#cccccc", activebackground="#333333",
+            relief="raised", bd=1, padx=4, pady=1,
+            command=self._toggle_audio_inject)
+        self.audio_inject_btn.pack(side="left", padx=(0, 6))
+        self.audio_inject_info = ttk.Label(ai_r0, text="", style="AudioMod.TLabel")
+        self.audio_inject_info.pack(side="left", padx=4)
+
+        self._audio_mod_slider(amf, "Inject Amp", 0.0, 1.0, 0.0, "audio_inject_amp")
+
         # ── Live Record ──────────────────────────────────────────────────
         rf = ttk.LabelFrame(col_right, text="LIVE RECORD (AVI → Downloads)")
         rf.pack(fill="x", pady=(0, 4))
@@ -751,6 +779,20 @@ class WaveformApp(tk.Tk):
         else:
             self.audio_mod_btn.configure(
                 text="⊘ CONNECT", bg="#333333", fg="#cccccc",
+                activebackground="#333333")
+
+    def _toggle_audio_inject(self):
+        self.audio_inject_enabled.set(not self.audio_inject_enabled.get())
+        self._update_audio_inject_btn()
+
+    def _update_audio_inject_btn(self):
+        if self.audio_inject_enabled.get():
+            self.audio_inject_btn.configure(
+                text="● INJECTED", bg="#226622", fg="#aaffaa",
+                activebackground="#226622")
+        else:
+            self.audio_inject_btn.configure(
+                text="⊘ INJECT", bg="#333333", fg="#cccccc",
                 activebackground="#333333")
 
     # ── Color helpers ────────────────────────────────────────────────────
@@ -908,6 +950,10 @@ class WaveformApp(tk.Tk):
                 "gain": self.audio_mod_gain.get(),
                 "smoothing": self.audio_mod_smoothing.get(),
             },
+            "audio_inject": {
+                "enabled": self.audio_inject_enabled.get(),
+                "amplitude": self.audio_inject_amp.get() if self.audio_inject_enabled.get() else 0.0,
+            },
             "fg_color": self.fg_color,
             "bg_color": self.bg_color,
         }
@@ -1027,6 +1073,7 @@ class WaveformApp(tk.Tk):
         self._audio_mod_depth_lbl.config(text=f"{self.audio_mod_depth.get():.2f}")
         self._audio_mod_gain_lbl.config(text=f"{self.audio_mod_gain.get():.2f}")
         self._audio_mod_smoothing_lbl.config(text=f"{self.audio_mod_smoothing.get():.3f}")
+        self._audio_inject_amp_lbl.config(text=f"{self.audio_inject_amp.get():.2f}")
 
         for mv in self.mod_vars:
             mv["depth_lbl"].config(text=f"{mv['depth'].get():.2f}")
@@ -1089,6 +1136,15 @@ class WaveformApp(tk.Tk):
         else:
             self.audio_mod_info.config(text="⚠ no audio loaded")
 
+        # Audio inject status
+        if not self.audio_inject_enabled.get():
+            self.audio_inject_info.config(text="☐ off")
+        elif self._audio_samples is not None:
+            amp = self.audio_inject_amp.get()
+            self.audio_inject_info.config(text=f"● amp={amp:.2f}")
+        else:
+            self.audio_inject_info.config(text="⚠ no audio loaded")
+
         params = self._build_params()
         pf = render_frame(PREVIEW_W, PREVIEW_H, wall, params, self._audio_samples)
         self._tk_img = ImageTk.PhotoImage(Image.fromarray(pf))
@@ -1127,6 +1183,10 @@ class WaveformApp(tk.Tk):
                 "gain": self.audio_mod_gain.get(),
                 "smoothing": self.audio_mod_smoothing.get(),
                 "enabled": self.audio_mod_enabled.get(),
+            },
+            "audio_inject": {
+                "enabled": self.audio_inject_enabled.get(),
+                "amplitude": self.audio_inject_amp.get(),
             },
             "audio_path": self._audio_path,
             "export_duration": self.duration_var.get(),
@@ -1168,6 +1228,10 @@ class WaveformApp(tk.Tk):
         self.audio_mod_smoothing.set(am.get("smoothing", 0.05))
         self.audio_mod_enabled.set(am.get("enabled", False))
         self._update_audio_mod_btn()
+        ai = p.get("audio_inject", {})
+        self.audio_inject_enabled.set(ai.get("enabled", False))
+        self.audio_inject_amp.set(ai.get("amplitude", 0.0))
+        self._update_audio_inject_btn()
         self.duration_var.set(p.get("export_duration", 5))
         self.format_var.set(p.get("export_format", "MP4"))
         self.res_var.set(p.get("export_res", "4K (2160×3840)"))
