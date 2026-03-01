@@ -304,9 +304,13 @@ def compute_waveform(y_norm, t, params, audio_samples=None):
 
 # ─── Rendering ────────────────────────────────────────────────────────────────
 
-def render_frame(width, height, t, params, audio_samples=None):
+def render_frame(width, height, t, params, audio_samples=None, trail_buffers=None):
     fg = params["fg_color"]
     bg = params["bg_color"]
+    line_thickness_mult = params.get("line_thickness", 1.0)
+    glow_intensity = params.get("line_glow", 1.0)
+    bloom_amount = params.get("line_bloom", 0.0)
+    trail_amount = params.get("line_trail", 0.0)
     y_norm = np.linspace(0, 1, height)
     wave = compute_waveform(y_norm, t, params, audio_samples)
     margin = width * 0.04
@@ -315,23 +319,40 @@ def render_frame(width, height, t, params, audio_samples=None):
     xs = centre + wave * usable
     img = np.full((height, width, 3), (bg[2], bg[1], bg[0]), dtype=np.uint8)
     scale = height / REF_H
-    thickness = max(1, round(scale))
+    thickness = max(1, round(scale * line_thickness_mult))
     pts = np.stack([xs.astype(np.float32), np.arange(height, dtype=np.float32)], axis=1)
     pts = pts.reshape((-1, 1, 2))
     pts_fixed = np.round(pts * 16).astype(np.int32)
     fg_bgr = (int(fg[2]), int(fg[1]), int(fg[0]))
+
+    # Glow layers (controlled by glow_intensity)
     cv2.polylines(img, [pts_fixed], False, fg_bgr, thickness, cv2.LINE_AA, shift=4)
-    if thickness >= 2:
+    if thickness >= 2 and glow_intensity > 0:
         glow = np.zeros_like(img)
         cv2.polylines(glow, [pts_fixed], False, fg_bgr, thickness * 3, cv2.LINE_AA, shift=4)
-        cv2.addWeighted(img, 1.0, glow, 0.3, 0, img)
+        cv2.addWeighted(img, 1.0, glow, 0.3 * glow_intensity, 0, img)
         glow2 = np.zeros_like(img)
         cv2.polylines(glow2, [pts_fixed], False, fg_bgr, thickness * 2, cv2.LINE_AA, shift=4)
-        cv2.addWeighted(img, 1.0, glow2, 0.25, 0, img)
+        cv2.addWeighted(img, 1.0, glow2, 0.25 * glow_intensity, 0, img)
     cv2.polylines(img, [pts_fixed], False, fg_bgr, thickness, cv2.LINE_AA, shift=4)
     if thickness >= 3:
         core_bgr = (min(255, int(fg[2])+120), min(255, int(fg[1])+120), min(255, int(fg[0])+120))
         cv2.polylines(img, [pts_fixed], False, core_bgr, max(1, thickness//3), cv2.LINE_AA, shift=4)
+
+    # Bloom (Gaussian blur glow)
+    if bloom_amount > 0:
+        ksize = max(3, int(scale * bloom_amount * 30) | 1)  # ensure odd
+        blurred = cv2.GaussianBlur(img, (ksize, ksize), 0)
+        cv2.addWeighted(img, 1.0, blurred, bloom_amount * 0.4, 0, img)
+
+    # Afterglow / Trail (phosphor persistence)
+    if trail_amount > 0 and trail_buffers is not None:
+        key = (width, height)
+        if key in trail_buffers:
+            prev = trail_buffers[key]
+            img = cv2.addWeighted(img, 1.0, prev, trail_amount, 0)
+        trail_buffers[key] = img.copy()
+
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     return img
 
@@ -432,6 +453,8 @@ class WaveformApp(tk.Tk):
         self._rec_count_in = False
         self._rec_count_start = 0.0
         self._beat_duration = 0.5
+
+        self._trail_buffers = {}
 
         self._build_ui()
         self._tick()
@@ -580,6 +603,14 @@ class WaveformApp(tk.Tk):
         self.bg_btn = tk.Button(cr, text="  BG  ", bg=self._hex(self.bg_color),
                                 command=self._pick_bg, relief="flat", font=("Consolas", 9))
         self.bg_btn.pack(side="left")
+
+        # ── Line Style ───────────────────────────────────────────────────
+        lsf = ttk.LabelFrame(col_left, text="LINE STYLE")
+        lsf.pack(fill="x", pady=(0, 4))
+        self._add_slider(lsf, "Thickness", 0.5, 6.0, 1.0, "line_thickness")
+        self._add_slider(lsf, "Glow",      0.0, 2.0, 1.0, "line_glow")
+        self._add_slider(lsf, "Bloom",     0.0, 3.0, 0.0, "line_bloom")
+        self._add_slider(lsf, "Trail",     0.0, 0.95, 0.0, "line_trail")
 
         # ── Patch ────────────────────────────────────────────────────────
         pf = ttk.LabelFrame(col_left, text="PATCH")
@@ -956,6 +987,10 @@ class WaveformApp(tk.Tk):
             },
             "fg_color": self.fg_color,
             "bg_color": self.bg_color,
+            "line_thickness": self.line_thickness.get(),
+            "line_glow": self.line_glow.get(),
+            "line_bloom": self.line_bloom.get(),
+            "line_trail": self.line_trail.get(),
         }
 
     # ── Live Recording ───────────────────────────────────────────────────
@@ -1007,11 +1042,12 @@ class WaveformApp(tk.Tk):
             return
         params = self._rec_params
         samples = self._rec_audio_samples
+        trail_buffers = {}
         fn = 0
         t0 = time.time()
         while not self._rec_stop:
             t = fn * FRAME_DUR
-            frame = render_frame(self._rec_w, self._rec_h, t, params, samples)
+            frame = render_frame(self._rec_w, self._rec_h, t, params, samples, trail_buffers)
             writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             fn += 1
             self._rec_frames = fn
@@ -1074,6 +1110,12 @@ class WaveformApp(tk.Tk):
         self._audio_mod_gain_lbl.config(text=f"{self.audio_mod_gain.get():.2f}")
         self._audio_mod_smoothing_lbl.config(text=f"{self.audio_mod_smoothing.get():.3f}")
         self._audio_inject_amp_lbl.config(text=f"{self.audio_inject_amp.get():.2f}")
+
+        # Line style labels
+        self._line_thickness_lbl.config(text=f"{self.line_thickness.get():.1f}×")
+        self._line_glow_lbl.config(text=f"{self.line_glow.get():.2f}")
+        self._line_bloom_lbl.config(text=f"{self.line_bloom.get():.2f}")
+        self._line_trail_lbl.config(text=f"{self.line_trail.get():.2f}")
 
         for mv in self.mod_vars:
             mv["depth_lbl"].config(text=f"{mv['depth'].get():.2f}")
@@ -1146,7 +1188,8 @@ class WaveformApp(tk.Tk):
             self.audio_inject_info.config(text="⚠ no audio loaded")
 
         params = self._build_params()
-        pf = render_frame(PREVIEW_W, PREVIEW_H, wall, params, self._audio_samples)
+        pf = render_frame(PREVIEW_W, PREVIEW_H, wall, params, self._audio_samples,
+                          trail_buffers=self._trail_buffers)
         self._tk_img = ImageTk.PhotoImage(Image.fromarray(pf))
         self.canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
         self.after(16, self._tick)
@@ -1193,6 +1236,10 @@ class WaveformApp(tk.Tk):
             "export_format": self.format_var.get(),
             "export_res": self.res_var.get(),
             "rec_res": self.rec_res_var.get(),
+            "line_thickness": self.line_thickness.get(),
+            "line_glow": self.line_glow.get(),
+            "line_bloom": self.line_bloom.get(),
+            "line_trail": self.line_trail.get(),
         }
 
     def _apply_patch(self, p):
@@ -1236,6 +1283,10 @@ class WaveformApp(tk.Tk):
         self.format_var.set(p.get("export_format", "MP4"))
         self.res_var.set(p.get("export_res", "4K (2160×3840)"))
         self.rec_res_var.set(p.get("rec_res", "1080×1920"))
+        self.line_thickness.set(p.get("line_thickness", 1.0))
+        self.line_glow.set(p.get("line_glow", 1.0))
+        self.line_bloom.set(p.get("line_bloom", 0.0))
+        self.line_trail.set(p.get("line_trail", 0.0))
         ap = p.get("audio_path")
         if ap and os.path.isfile(ap):
             self._load_audio(ap)
@@ -1304,6 +1355,7 @@ class WaveformApp(tk.Tk):
             return
         params = self._build_params()
         samples = self._audio_samples
+        trail_buffers = {}
         ts = time.time()
         for i in range(total):
             if self._export_cancel:
@@ -1315,7 +1367,7 @@ class WaveformApp(tk.Tk):
                 self._done("Export cancelled.")
                 return
             t = i * FRAME_DUR
-            frame_rgb = render_frame(ew, eh, t, params, samples)
+            frame_rgb = render_frame(ew, eh, t, params, samples, trail_buffers)
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             writer.write(frame_bgr)
             pct = (i + 1) / total * 100
