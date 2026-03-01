@@ -1246,7 +1246,7 @@ class WaveformApp(tk.Tk):
         bar_num = self.bar_var.get()
         fine = self.bar_fine_var.get()
         target_time = (bar_num - 1 + fine) * bar_duration
-        self._elapsed = target_time
+        self._elapsed = 0.0
         if self.playing:
             self._t0 = time.time()
             if HAS_PYGAME and self._audio_loaded:
@@ -1323,10 +1323,20 @@ class WaveformApp(tk.Tk):
 
     # ── Transport ────────────────────────────────────────────────────────
 
+    def _bar_start_time(self):
+        """Return the absolute time offset represented by the bar slider position."""
+        beat_hz = self.bpm_var.get() / 60.0
+        bar_duration = 4.0 / beat_hz
+        bar_start = (self.bar_var.get() - 1) * bar_duration
+        if hasattr(self, 'bar_fine_var'):
+            bar_start += self.bar_fine_var.get() * bar_duration
+        return bar_start
+
     def _wall_time(self):
+        bar_start = self._bar_start_time()
         if self.playing:
-            return self._elapsed + (time.time() - self._t0)
-        return self._elapsed
+            return bar_start + self._elapsed + (time.time() - self._t0)
+        return bar_start + self._elapsed
 
     def _play(self):
         if self.playing:
@@ -1340,12 +1350,13 @@ class WaveformApp(tk.Tk):
             self.play_btn.config(text="⏸  PAUSE")
             if HAS_PYGAME and self._audio_loaded:
                 try:
-                    pygame.mixer.music.play(0, start=self._elapsed)
+                    pygame.mixer.music.play(0, start=self._bar_start_time() + self._elapsed)
                 except TypeError:
                     pygame.mixer.music.play(0)
 
     def _stop(self):
-        self._elapsed = self._wall_time()
+        if self.playing:
+            self._elapsed += time.time() - self._t0
         self.playing = False
         self._stop_audio()
         self.play_btn.config(text="▶  PLAY")
@@ -1581,7 +1592,7 @@ class WaveformApp(tk.Tk):
             self.play_btn.config(text="⏸  PAUSE")
             if HAS_PYGAME and self._audio_loaded:
                 try:
-                    pygame.mixer.music.play(0)
+                    pygame.mixer.music.play(0, start=self._bar_start_time())
                 except Exception:
                     pass
             self.auto_write_btn.config(
@@ -1607,7 +1618,7 @@ class WaveformApp(tk.Tk):
             self.play_btn.config(text="⏸  PAUSE")
             if HAS_PYGAME and self._audio_loaded:
                 try:
-                    pygame.mixer.music.play(0)
+                    pygame.mixer.music.play(0, start=self._bar_start_time())
                 except Exception:
                     pass
             self.auto_overdub_btn.config(
@@ -1720,8 +1731,9 @@ class WaveformApp(tk.Tk):
             self.auto_status_lbl.config(text="No automation")
 
         wall = self._wall_time()
-        m = int(wall) // 60
-        sec = wall - m * 60
+        transport = wall - self._bar_start_time()
+        m = int(transport) // 60
+        sec = transport - m * 60
         self.time_lbl.config(text=f"{m:02d}:{sec:06.3f}")
 
         # Bar / beat tracking
@@ -1732,10 +1744,6 @@ class WaveformApp(tk.Tk):
         self.bar_lbl.config(text=f"Bar {current_bar}")
         self.beat_lbl.config(text=f"Beat {beat_in_bar:.1f}")
         self.bar_fine_lbl.config(text=f"{self.bar_fine_var.get():.2f}")
-        if self.playing:
-            self._bar_tracking = True
-            self.bar_var.set(current_bar)
-            self._bar_tracking = False
 
         # Audio level meter
         if not self.audio_mod_enabled.get():
@@ -1923,9 +1931,7 @@ class WaveformApp(tk.Tk):
         validated_bar = max(1, bar)
         self.bar_var.set(validated_bar)
         self.bar_fine_var.set(fine)
-        bpm = self.bpm_var.get()
-        bar_duration = 4 * 60.0 / bpm  # 4 beats per bar (4/4 time)
-        self._elapsed = (validated_bar - 1 + fine) * bar_duration
+        self._elapsed = 0.0
 
     # ── Snapshot methods ─────────────────────────────────────────────────
 
